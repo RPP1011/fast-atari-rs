@@ -147,6 +147,16 @@ impl HeadlessTia {
         }
     }
 
+    /// Advance by `n` CPU cycles (3*n TIA clocks) in one call.
+    /// Handles at most one scanline boundary crossing (safe for n <= 76).
+    #[inline]
+    pub fn tick_n(&mut self, n: u8) {
+        self.clock += n as u16 * 3;
+        if self.clock >= 228 {
+            self.end_scanline();
+        }
+    }
+
     /// How many CPU cycles remain until end of current scanline.
     /// Returns 0 if we're exactly at a scanline boundary.
     #[inline]

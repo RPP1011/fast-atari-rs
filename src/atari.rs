@@ -587,14 +587,6 @@ impl HeadlessAtari {
         self.bus.tia.set_paddle(0, paddle);
     }
 
-    /// Advance one CPU cycle worth of TIA + PIA clocks.
-    /// Uses tick3 (single call per CPU cycle) instead of 3× tick.
-    #[inline]
-    fn tick_components(&mut self) {
-        self.bus.tia.tick3();
-        self.bus.pia.tick();
-    }
-
     pub fn run_frame(&mut self) -> u64 {
         self.bus.tia.frame_complete = false;
         let mut cycles: u64 = 0;
@@ -619,11 +611,11 @@ impl HeadlessAtari {
             self.bus.pia.tick_n(skipped);
             *cycles += skipped as u64;
         } else {
-            let c = self.cpu.step(&mut self.bus) as u64;
-            *cycles += c;
-            for _ in 0..c {
-                self.tick_components();
-            }
+            let c = self.cpu.step(&mut self.bus);
+            *cycles += c as u64;
+            // Batch-advance TIA and PIA instead of per-cycle loop
+            self.bus.tia.tick_n(c);
+            self.bus.pia.tick_n(c as u16);
         }
     }
 
