@@ -2,6 +2,7 @@
 
 use crate::cpu::{Cpu, Memory};
 use crate::env::{Env, StepInfo};
+use crate::headless_tia::HeadlessTia;
 use crate::pia::Pia;
 use crate::tia::{Tia, FRAME_WIDTH, FRAME_HEIGHT};
 
@@ -79,31 +80,107 @@ impl Action {
     }
 }
 
+/// Bank switching scheme, auto-detected from ROM size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankScheme {
+    /// 2K or 4K — no bankswitching, simple mirroring.
+    Fixed,
+    /// F8 — 8K, two 4K banks. Hotspots: $1FF8 (bank 0), $1FF9 (bank 1).
+    F8,
+    /// F6 — 16K, four 4K banks. Hotspots: $1FF6–$1FF9.
+    F6,
+    /// F4 — 32K, eight 4K banks. Hotspots: $1FF4–$1FFB.
+    F4,
+}
+
+impl BankScheme {
+    pub fn detect(rom_len: usize) -> Self {
+        match rom_len {
+            0..=4096 => Self::Fixed,
+            4097..=8192 => Self::F8,
+            8193..=16384 => Self::F6,
+            _ => Self::F4,
+        }
+    }
+}
+
 /// The Atari 2600 memory bus, visible to the CPU.
 pub struct Bus {
     pub tia: Tia,
     pub pia: Pia,
     pub rom: Vec<u8>,
+    pub bank: usize,
+    pub scheme: BankScheme,
 }
 
 impl Bus {
     fn new(rom: Vec<u8>) -> Self {
+        let scheme = BankScheme::detect(rom.len());
+        // Default to last bank (where reset vector lives)
+        let bank = match scheme {
+            BankScheme::Fixed => 0,
+            BankScheme::F8 => 1,
+            BankScheme::F6 => 3,
+            BankScheme::F4 => 7,
+        };
         Self {
             tia: Tia::new(),
             pia: Pia::new(),
             rom,
+            bank,
+            scheme,
         }
     }
 
-    /// Map a ROM address to the correct byte, handling 2K/4K mirroring.
+    /// Read from the currently selected ROM bank.
     fn rom_read(&self, addr: u16) -> u8 {
-        let index = (addr & 0x0FFF) as usize % self.rom.len();
-        self.rom[index]
+        match self.scheme {
+            BankScheme::Fixed => {
+                let index = (addr & 0x0FFF) as usize % self.rom.len();
+                self.rom[index]
+            }
+            _ => {
+                let offset = self.bank * 4096 + (addr & 0x0FFF) as usize;
+                *self.rom.get(offset).unwrap_or(&0)
+            }
+        }
+    }
+
+    /// Check for bankswitching hotspot access and switch bank if needed.
+    fn check_bankswitch(&mut self, addr: u16) {
+        let a = addr & 0x1FFF;
+        match self.scheme {
+            BankScheme::Fixed => {}
+            BankScheme::F8 => match a {
+                0x1FF8 => self.bank = 0,
+                0x1FF9 => self.bank = 1,
+                _ => {}
+            },
+            BankScheme::F6 => match a {
+                0x1FF6 => self.bank = 0,
+                0x1FF7 => self.bank = 1,
+                0x1FF8 => self.bank = 2,
+                0x1FF9 => self.bank = 3,
+                _ => {}
+            },
+            BankScheme::F4 => match a {
+                0x1FF4 => self.bank = 0,
+                0x1FF5 => self.bank = 1,
+                0x1FF6 => self.bank = 2,
+                0x1FF7 => self.bank = 3,
+                0x1FF8 => self.bank = 4,
+                0x1FF9 => self.bank = 5,
+                0x1FFA => self.bank = 6,
+                0x1FFB => self.bank = 7,
+                _ => {}
+            },
+        }
     }
 }
 
 impl Memory for Bus {
     fn read(&mut self, addr: u16) -> u8 {
+        self.check_bankswitch(addr);
         match addr & 0x1FFF {
             // TIA read registers: $00–$0D (active when A12=0, A7=0)
             a if a & 0x1080 == 0x0000 => self.tia.read(a),
@@ -118,6 +195,7 @@ impl Memory for Bus {
     }
 
     fn write(&mut self, addr: u16, val: u8) {
+        self.check_bankswitch(addr);
         match addr & 0x1FFF {
             // TIA write registers: $00–$2C (A12=0, A7=0)
             a if a & 0x1080 == 0x0000 => self.tia.write(a, val),
@@ -125,7 +203,6 @@ impl Memory for Bus {
             a if a & 0x1280 == 0x0080 => self.pia.write(a, val),
             // PIA I/O: $280–$29F
             a if a & 0x1280 == 0x0280 => self.pia.write(a, val),
-            // ROM writes (bank switching would go here)
             _ => {}
         }
     }
@@ -135,6 +212,10 @@ impl Memory for Bus {
 pub struct Atari {
     pub cpu: Cpu,
     pub bus: Bus,
+    /// Pending TIA/PIA ticks from the previous CPU instruction.
+    /// Flushed before the next instruction executes, so register
+    /// writes land at the correct beam position.
+    pending_cycles: u64,
 }
 
 impl Atari {
@@ -142,6 +223,7 @@ impl Atari {
         let mut console = Self {
             cpu: Cpu::new(),
             bus: Bus::new(rom),
+            pending_cycles: 0,
         };
         console.cpu.reset(&mut console.bus);
         console
@@ -163,40 +245,74 @@ impl Atari {
 
         // Fire button via TIA input latch (active low: false = pressed)
         self.bus.tia.set_input(0, !fire);
+
+        // Map left/right to paddle position for paddle-based games
+        let paddle = if left { 200u8 } else if right { 50u8 } else { 128u8 };
+        self.bus.tia.set_paddle(0, paddle);
+    }
+
+    /// Tick TIA and PIA for one CPU cycle (3 TIA clocks, 1 PIA clock).
+    #[inline]
+    fn tick_components(&mut self) {
+        self.bus.tia.tick();
+        self.bus.tia.tick();
+        self.bus.tia.tick();
+        self.bus.pia.tick();
     }
 
     /// Run the console until the next frame is complete.
     /// Returns the number of CPU cycles executed.
     pub fn run_frame(&mut self) -> u64 {
+        // Wait for VSYNC to signal frame complete, but ignore if it's
+        // already set from the previous frame.
         self.bus.tia.frame_complete = false;
         let mut cycles: u64 = 0;
 
-        while !self.bus.tia.frame_complete {
-            // If WSYNC is active, skip CPU but keep TIA/PIA ticking
-            if !self.bus.tia.wsync {
-                let c = self.cpu.step(&mut self.bus) as u64;
-                cycles += c;
-
-                // Each CPU cycle = 3 TIA clocks, 1 PIA clock
-                for _ in 0..c {
-                    self.bus.tia.tick();
-                    self.bus.tia.tick();
-                    self.bus.tia.tick();
-                    self.bus.pia.tick();
-                }
-            } else {
-                // WSYNC: run TIA clocks until end of scanline
-                while self.bus.tia.wsync {
-                    self.bus.tia.tick();
-                    self.bus.tia.tick();
-                    self.bus.tia.tick();
-                    self.bus.pia.tick();
-                    cycles += 1;
-                }
-            }
+        // Phase 1: If we're currently in VSYNC, run until VSYNC ends
+        while self.bus.tia.vsync & 0x02 != 0 {
+            self.run_one_cycle(&mut cycles);
         }
 
+        // Phase 2: Run until the next VSYNC starts (= end of this frame)
+        while self.bus.tia.vsync & 0x02 == 0 {
+            self.run_one_cycle(&mut cycles);
+            // Safety: break if we've run way too many cycles (broken ROM)
+            if cycles > 100_000 { break; }
+        }
+
+        // Flush any remaining pending ticks so the framebuffer is complete
+        for _ in 0..self.pending_cycles {
+            self.tick_components();
+        }
+        self.pending_cycles = 0;
+
         cycles
+    }
+
+    /// Flush pending TIA/PIA ticks, then execute one CPU instruction.
+    /// The key insight: by ticking TIA for the *previous* instruction's
+    /// cycles before executing the *next* instruction, register writes
+    /// from the CPU land when the TIA beam is at the correct position.
+    #[inline]
+    fn run_one_cycle(&mut self, cycles: &mut u64) {
+        // Flush pending ticks from the previous instruction
+        for _ in 0..self.pending_cycles {
+            self.tick_components();
+        }
+        self.pending_cycles = 0;
+
+        if self.bus.tia.wsync {
+            // CPU halted — tick one CPU cycle at a time until WSYNC clears
+            self.tick_components();
+            *cycles += 1;
+        } else {
+            // Execute CPU instruction — writes to TIA happen here
+            let c = self.cpu.step(&mut self.bus) as u64;
+            *cycles += c;
+            // Don't tick yet — defer until next call so the beam advances
+            // to the correct position before the next instruction's writes
+            self.pending_cycles = c;
+        }
     }
 
     /// Get the current framebuffer as NTSC palette indices (160 x 192).
@@ -256,6 +372,171 @@ impl Env for Atari {
     }
 
     fn close(&mut self) {}
+}
+
+// ---------------------------------------------------------------------------
+// Headless Atari — no framebuffer, no pixel rendering, maximum throughput.
+// ---------------------------------------------------------------------------
+
+/// Memory bus using HeadlessTia instead of the rendering Tia.
+pub struct HeadlessBus {
+    pub tia: HeadlessTia,
+    pub pia: Pia,
+    pub rom: Vec<u8>,
+    pub bank: usize,
+    pub scheme: BankScheme,
+}
+
+impl HeadlessBus {
+    fn new(rom: Vec<u8>) -> Self {
+        let scheme = BankScheme::detect(rom.len());
+        let bank = match scheme {
+            BankScheme::Fixed => 0,
+            BankScheme::F8 => 1,
+            BankScheme::F6 => 3,
+            BankScheme::F4 => 7,
+        };
+        Self { tia: HeadlessTia::new(), pia: Pia::new(), rom, bank, scheme }
+    }
+
+    fn rom_read(&self, addr: u16) -> u8 {
+        match self.scheme {
+            BankScheme::Fixed => {
+                let index = (addr & 0x0FFF) as usize % self.rom.len();
+                self.rom[index]
+            }
+            _ => {
+                let offset = self.bank * 4096 + (addr & 0x0FFF) as usize;
+                *self.rom.get(offset).unwrap_or(&0)
+            }
+        }
+    }
+
+    fn check_bankswitch(&mut self, addr: u16) {
+        let a = addr & 0x1FFF;
+        match self.scheme {
+            BankScheme::Fixed => {}
+            BankScheme::F8 => match a {
+                0x1FF8 => self.bank = 0,
+                0x1FF9 => self.bank = 1,
+                _ => {}
+            },
+            BankScheme::F6 => match a {
+                0x1FF6 => self.bank = 0,
+                0x1FF7 => self.bank = 1,
+                0x1FF8 => self.bank = 2,
+                0x1FF9 => self.bank = 3,
+                _ => {}
+            },
+            BankScheme::F4 => match a {
+                0x1FF4 => self.bank = 0,
+                0x1FF5 => self.bank = 1,
+                0x1FF6 => self.bank = 2,
+                0x1FF7 => self.bank = 3,
+                0x1FF8 => self.bank = 4,
+                0x1FF9 => self.bank = 5,
+                0x1FFA => self.bank = 6,
+                0x1FFB => self.bank = 7,
+                _ => {}
+            },
+        }
+    }
+}
+
+impl Memory for HeadlessBus {
+    fn read(&mut self, addr: u16) -> u8 {
+        self.check_bankswitch(addr);
+        match addr & 0x1FFF {
+            a if a & 0x1080 == 0x0000 => self.tia.read(a),
+            a if a & 0x1280 == 0x0080 => self.pia.read(a),
+            a if a & 0x1280 == 0x0280 => self.pia.read(a),
+            a if a & 0x1000 == 0x1000 => self.rom_read(a),
+            _ => 0,
+        }
+    }
+
+    fn write(&mut self, addr: u16, val: u8) {
+        self.check_bankswitch(addr);
+        match addr & 0x1FFF {
+            a if a & 0x1080 == 0x0000 => self.tia.write(a, val),
+            a if a & 0x1280 == 0x0080 => self.pia.write(a, val),
+            a if a & 0x1280 == 0x0280 => self.pia.write(a, val),
+            _ => {}
+        }
+    }
+}
+
+/// Headless Atari 2600 — skips all pixel rendering for maximum throughput.
+pub struct HeadlessAtari {
+    pub cpu: Cpu,
+    pub bus: HeadlessBus,
+}
+
+impl HeadlessAtari {
+    pub fn new(rom: Vec<u8>) -> Self {
+        let mut console = Self {
+            cpu: Cpu::new(),
+            bus: HeadlessBus::new(rom),
+        };
+        console.cpu.reset(&mut console.bus);
+        console
+    }
+
+    pub fn set_action(&mut self, action: Action) {
+        let (up, down, left, right, fire) = action.decode();
+        let mut swcha = 0xFF;
+        if up    { swcha &= !0x10; }
+        if down  { swcha &= !0x20; }
+        if left  { swcha &= !0x40; }
+        if right { swcha &= !0x80; }
+        self.bus.pia.set_port_a_input(swcha);
+        self.bus.tia.set_input(0, !fire);
+        let paddle = if left { 200u8 } else if right { 50u8 } else { 128u8 };
+        self.bus.tia.set_paddle(0, paddle);
+    }
+
+    /// Advance one CPU cycle worth of TIA + PIA clocks.
+    /// Uses tick3 (single call per CPU cycle) instead of 3× tick.
+    #[inline]
+    fn tick_components(&mut self) {
+        self.bus.tia.tick3();
+        self.bus.pia.tick();
+    }
+
+    pub fn run_frame(&mut self) -> u64 {
+        self.bus.tia.frame_complete = false;
+        let mut cycles: u64 = 0;
+
+        while self.bus.tia.vsync & 0x02 != 0 {
+            self.run_one_cycle(&mut cycles);
+        }
+
+        while self.bus.tia.vsync & 0x02 == 0 {
+            self.run_one_cycle(&mut cycles);
+            if cycles > 100_000 { break; }
+        }
+
+        cycles
+    }
+
+    #[inline]
+    fn run_one_cycle(&mut self, cycles: &mut u64) {
+        if self.bus.tia.wsync {
+            self.tick_components();
+            *cycles += 1;
+        } else {
+            let c = self.cpu.step(&mut self.bus) as u64;
+            *cycles += c;
+            for _ in 0..c {
+                self.tick_components();
+            }
+        }
+    }
+
+    /// Access PIA RAM for observation (128 bytes, no rendering needed).
+    pub fn ram(&self) -> &[u8; 128] {
+        &self.bus.pia.ram
+    }
 }
 
 /// NTSC color palette (128 colors, indexed by the TIA color register value).
