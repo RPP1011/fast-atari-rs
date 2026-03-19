@@ -1005,10 +1005,59 @@ impl Cpu {
             OpCode::CldImplied => { self.status.decimal = false; }
             OpCode::SedImplied => { self.status.decimal = true; }
 
+            // Branch Instructions — all relative addressing
+            // Offset is a signed i8; extra cycle if taken, another if page crossed
+            OpCode::BplRelative(off) => {
+                if !self.status.negative {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1; // TODO: +1 more if page cross
+                }
+            }
+            OpCode::BmiRelative(off) => {
+                if self.status.negative {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BvcRelative(off) => {
+                if !self.status.overflow {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BvsRelative(off) => {
+                if self.status.overflow {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BccRelative(off) => {
+                if !self.status.carry {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BcsRelative(off) => {
+                if self.status.carry {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BneRelative(off) => {
+                if !self.status.zero {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+            OpCode::BeqRelative(off) => {
+                if self.status.zero {
+                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
+                    return details.cycle_count + 1;
+                }
+            }
+
             // NOP
             OpCode::NopImplied => {}
-
-            _ => unimplemented!(),
         }
 
         self.pc += op.size();
