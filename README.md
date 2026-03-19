@@ -18,33 +18,41 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 
 | Emulator | FPS |
 |---|---|
-| fast-atari-rs (headless, WSYNC fast-forward) | **12,283** |
-| fast-atari-rs (headless) | 10,118 |
+| **fast-atari-rs (headless, cpu-optimized)** | **18,479** |
 | ALE-raw (headless, no obs) | 16,240 |
 | ALE-raw (screen obs) | 13,164 |
 | ALE (gymnasium) | 12,429 |
-| fast-atari-rs (rendering) | 2,268 |
+| fast-atari-rs (rendering) | 2,269 |
 
 #### Aggregate throughput at 32 cores
 
 | Emulator | FPS | Efficiency |
 |---|---|---|
+| **fast-atari-rs (headless)** | **302,948** | **51.2%** |
 | ALE-raw (headless) | 248,310 | 47.8% |
-| **fast-atari-rs (headless)** | **210,129** | **53.5%** |
 | ALE (gymnasium) | 186,683 | 46.9% |
 
-fast-atari-rs headless is within 1.3x of ALE's raw C++ core per-thread, with better parallel scaling. The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
+fast-atari-rs headless is **1.14x faster** than ALE's raw C++ core single-threaded, and **1.22x faster** at 32 cores. The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
 
-### Profiling (headless mode)
+#### CPU-optimized branch optimizations
+
+| Optimization | Single-thread FPS | Cumulative speedup |
+|---|---|---|
+| Baseline headless | 10,118 | 1.0x |
+| + WSYNC fast-forward | 12,283 | 1.21x |
+| + Flat 8KB memory bus | 16,167 | 1.60x |
+| + Static opcode tables | 17,127 | 1.69x |
+| + Inline bankswitch elision | 18,479 | 1.83x |
+
+### Profiling (headless mode, cpu-optimized)
 
 | Function | % time |
 |---|---|
-| `Cpu::step` (instruction dispatch) | 32.0% |
-| `run_one_cycle` (frame loop + component ticking) | 31.6% |
-| `HeadlessBus::read` (address decoding) | 19.9% |
-| `Cpu::resolve_addr` | 5.5% |
-| `OpCode::details` | 3.0% |
-| Other | 8.0% |
+| `run_one_cycle` (frame loop + TIA/PIA tick) | 33.9% |
+| `Cpu::step` (instruction dispatch) | 29.2% |
+| `HeadlessBus::read` (flat array lookup) | 23.9% |
+| `Cpu::resolve_addr` | 4.4% |
+| Other | 8.6% |
 
 ### Running benchmarks
 

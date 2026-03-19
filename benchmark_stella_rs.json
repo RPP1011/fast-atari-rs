@@ -1,0 +1,8 @@
+[
+  {"emulator": "stella-rs", "threads": 1, "elapsed": 5.000, "total_frames": 11342, "total_cycles": 226703896, "fps": 2268.3, "fps_per_thread": 2268.3},
+  {"emulator": "stella-rs", "threads": 2, "elapsed": 5.001, "total_frames": 22728, "total_cycles": 454287264, "fps": 4544.8, "fps_per_thread": 2272.4},
+  {"emulator": "stella-rs", "threads": 4, "elapsed": 5.001, "total_frames": 44276, "total_cycles": 884988688, "fps": 8854.1, "fps_per_thread": 2213.5},
+  {"emulator": "stella-rs", "threads": 8, "elapsed": 5.001, "total_frames": 87018, "total_cycles": 1739315784, "fps": 17401.1, "fps_per_thread": 2175.1},
+  {"emulator": "stella-rs", "threads": 16, "elapsed": 5.001, "total_frames": 163773, "total_cycles": 3273494724, "fps": 32748.1, "fps_per_thread": 2046.8},
+  {"emulator": "stella-rs", "threads": 32, "elapsed": 5.003, "total_frames": 184830, "total_cycles": 3694382040, "fps": 36947.0, "fps_per_thread": 1154.6}
+]
