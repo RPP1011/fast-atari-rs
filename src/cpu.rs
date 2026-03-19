@@ -621,13 +621,218 @@ impl Cpu {
         let details = op.details();
 
         match op {
-            // ADC — all addressing modes collapse to one operation
+            // ADC — Add with Carry
             OpCode::AdcImmediate(_) | OpCode::AdcZeroPage(_) | OpCode::AdcZeroPageX(_) |
             OpCode::AdcAbsolute(_)  | OpCode::AdcAbsoluteX(_) | OpCode::AdcAbsoluteY(_) |
             OpCode::AdcIndirectX(_) | OpCode::AdcIndirectY(_) => {
                 let val = self.resolve(&op, memory);
-                self.a = self.a.wrapping_add(val);
+                let carry = self.status.carry as u8;
+                let (sum1, c1) = self.a.overflowing_add(val);
+                let (sum2, c2) = sum1.overflowing_add(carry);
+                self.status.carry = c1 || c2;
+                self.status.overflow = (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0;
+                self.a = sum2;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
             }
+
+            // SBC — Subtract with Carry (borrow)
+            OpCode::SbcImmediate(_) | OpCode::SbcZeroPage(_) | OpCode::SbcZeroPageX(_) |
+            OpCode::SbcAbsolute(_)  | OpCode::SbcAbsoluteX(_) | OpCode::SbcAbsoluteY(_) |
+            OpCode::SbcIndirectX(_) | OpCode::SbcIndirectY(_) => {
+                let val = self.resolve(&op, memory);
+                let borrow = !self.status.carry as u8;
+                let (diff1, b1) = self.a.overflowing_sub(val);
+                let (diff2, b2) = diff1.overflowing_sub(borrow);
+                self.status.carry = !(b1 || b2);
+                self.status.overflow = ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0;
+                self.a = diff2;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // AND — Bitwise AND
+            OpCode::AndImmediate(_) | OpCode::AndZeroPage(_) | OpCode::AndZeroPageX(_) |
+            OpCode::AndAbsolute(_)  | OpCode::AndAbsoluteX(_) | OpCode::AndAbsoluteY(_) |
+            OpCode::AndIndirectX(_) | OpCode::AndIndirectY(_) => {
+                self.a &= self.resolve(&op, memory);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // ORA — Bitwise OR
+            OpCode::OraImmediate(_) | OpCode::OraZeroPage(_) | OpCode::OraZeroPageX(_) |
+            OpCode::OraAbsolute(_)  | OpCode::OraAbsoluteX(_) | OpCode::OraAbsoluteY(_) |
+            OpCode::OraIndirectX(_) | OpCode::OraIndirectY(_) => {
+                self.a |= self.resolve(&op, memory);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // EOR — Bitwise Exclusive OR
+            OpCode::EorImmediate(_) | OpCode::EorZeroPage(_) | OpCode::EorZeroPageX(_) |
+            OpCode::EorAbsolute(_)  | OpCode::EorAbsoluteX(_) | OpCode::EorAbsoluteY(_) |
+            OpCode::EorIndirectX(_) | OpCode::EorIndirectY(_) => {
+                self.a ^= self.resolve(&op, memory);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // CMP — Compare accumulator
+            OpCode::CmpImmediate(_) | OpCode::CmpZeroPage(_) | OpCode::CmpZeroPageX(_) |
+            OpCode::CmpAbsolute(_)  | OpCode::CmpAbsoluteX(_) | OpCode::CmpAbsoluteY(_) |
+            OpCode::CmpIndirectX(_) | OpCode::CmpIndirectY(_) => {
+                let val = self.resolve(&op, memory);
+                let result = self.a.wrapping_sub(val);
+                self.status.carry = self.a >= val;
+                self.status.zero = result == 0;
+                self.status.negative = result & 0x80 != 0;
+            }
+
+            // CPX — Compare X register
+            OpCode::CpxImmediate(_) | OpCode::CpxZeroPage(_) | OpCode::CpxAbsolute(_) => {
+                let val = self.resolve(&op, memory);
+                let result = self.x.wrapping_sub(val);
+                self.status.carry = self.x >= val;
+                self.status.zero = result == 0;
+                self.status.negative = result & 0x80 != 0;
+            }
+
+            // CPY — Compare Y register
+            OpCode::CpyImmediate(_) | OpCode::CpyZeroPage(_) | OpCode::CpyAbsolute(_) => {
+                let val = self.resolve(&op, memory);
+                let result = self.y.wrapping_sub(val);
+                self.status.carry = self.y >= val;
+                self.status.zero = result == 0;
+                self.status.negative = result & 0x80 != 0;
+            }
+
+            // INC — Increment memory
+            OpCode::IncZeroPage(_) | OpCode::IncZeroPageX(_) |
+            OpCode::IncAbsolute(_) | OpCode::IncAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let val = memory.read(addr).wrapping_add(1);
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
+            // DEC — Decrement memory
+            OpCode::DecZeroPage(_) | OpCode::DecZeroPageX(_) |
+            OpCode::DecAbsolute(_) | OpCode::DecAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let val = memory.read(addr).wrapping_sub(1);
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
+            // INX / INY / DEX / DEY — Register increment/decrement
+            OpCode::InxImplied => {
+                self.x = self.x.wrapping_add(1);
+                self.status.zero = self.x == 0;
+                self.status.negative = self.x & 0x80 != 0;
+            }
+            OpCode::InyImplied => {
+                self.y = self.y.wrapping_add(1);
+                self.status.zero = self.y == 0;
+                self.status.negative = self.y & 0x80 != 0;
+            }
+            OpCode::DexImplied => {
+                self.x = self.x.wrapping_sub(1);
+                self.status.zero = self.x == 0;
+                self.status.negative = self.x & 0x80 != 0;
+            }
+            OpCode::DeyImplied => {
+                self.y = self.y.wrapping_sub(1);
+                self.status.zero = self.y == 0;
+                self.status.negative = self.y & 0x80 != 0;
+            }
+
+            // ASL — Arithmetic Shift Left
+            OpCode::AslAccumulator => {
+                self.status.carry = self.a & 0x80 != 0;
+                self.a <<= 1;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+            OpCode::AslZeroPage(_) | OpCode::AslZeroPageX(_) |
+            OpCode::AslAbsolute(_) | OpCode::AslAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let mut val = memory.read(addr);
+                self.status.carry = val & 0x80 != 0;
+                val <<= 1;
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
+            // LSR — Logical Shift Right
+            OpCode::LsrAccumulator => {
+                self.status.carry = self.a & 0x01 != 0;
+                self.a >>= 1;
+                self.status.zero = self.a == 0;
+                self.status.negative = false;
+            }
+            OpCode::LsrZeroPage(_) | OpCode::LsrZeroPageX(_) |
+            OpCode::LsrAbsolute(_) | OpCode::LsrAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let mut val = memory.read(addr);
+                self.status.carry = val & 0x01 != 0;
+                val >>= 1;
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = false;
+            }
+
+            // ROL — Rotate Left
+            OpCode::RolAccumulator => {
+                let old_carry = self.status.carry as u8;
+                self.status.carry = self.a & 0x80 != 0;
+                self.a = (self.a << 1) | old_carry;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+            OpCode::RolZeroPage(_) | OpCode::RolZeroPageX(_) |
+            OpCode::RolAbsolute(_) | OpCode::RolAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let mut val = memory.read(addr);
+                let old_carry = self.status.carry as u8;
+                self.status.carry = val & 0x80 != 0;
+                val = (val << 1) | old_carry;
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
+            // ROR — Rotate Right
+            OpCode::RorAccumulator => {
+                let old_carry = self.status.carry as u8;
+                self.status.carry = self.a & 0x01 != 0;
+                self.a = (self.a >> 1) | (old_carry << 7);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+            OpCode::RorZeroPage(_) | OpCode::RorZeroPageX(_) |
+            OpCode::RorAbsolute(_) | OpCode::RorAbsoluteX(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                let mut val = memory.read(addr);
+                let old_carry = self.status.carry as u8;
+                self.status.carry = val & 0x01 != 0;
+                val = (val >> 1) | (old_carry << 7);
+                memory.write(addr, val);
+                self.status.zero = val == 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
+            // BIT — Test bits
+            OpCode::BitZeroPage(_) | OpCode::BitAbsolute(_) => {
+                let val = self.resolve(&op, memory);
+                self.status.zero = (self.a & val) == 0;
+                self.status.overflow = val & 0x40 != 0;
+                self.status.negative = val & 0x80 != 0;
+            }
+
             _ => unimplemented!(),
         }
 
