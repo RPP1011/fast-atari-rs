@@ -603,6 +603,35 @@ impl Cpu {
         }
     }
 
+    /// Returns 1 if the addressing mode crossed a page boundary, 0 otherwise.
+    /// Only relevant for AbsoluteX, AbsoluteY, and IndirectY modes.
+    fn page_cross_penalty<M: Memory>(&self, op: &OpCode, memory: &mut M) -> u8 {
+        match *op {
+            // Absolute,X — page cross if base and base+X differ in high byte
+            OpCode::AdcAbsoluteX(addr) | OpCode::AndAbsoluteX(addr) | OpCode::CmpAbsoluteX(addr) |
+            OpCode::EorAbsoluteX(addr) | OpCode::LdaAbsoluteX(addr) | OpCode::LdyAbsoluteX(addr) |
+            OpCode::OraAbsoluteX(addr) | OpCode::SbcAbsoluteX(addr) => {
+                if (addr & 0xFF00) != (addr.wrapping_add(self.x as u16) & 0xFF00) { 1 } else { 0 }
+            }
+            // Absolute,Y
+            OpCode::AdcAbsoluteY(addr) | OpCode::AndAbsoluteY(addr) | OpCode::CmpAbsoluteY(addr) |
+            OpCode::EorAbsoluteY(addr) | OpCode::LdaAbsoluteY(addr) | OpCode::LdxAbsoluteY(addr) |
+            OpCode::OraAbsoluteY(addr) | OpCode::SbcAbsoluteY(addr) => {
+                if (addr & 0xFF00) != (addr.wrapping_add(self.y as u16) & 0xFF00) { 1 } else { 0 }
+            }
+            // Indirect,Y — page cross if base pointer value and value+Y differ in high byte
+            OpCode::AdcIndirectY(zp) | OpCode::AndIndirectY(zp) | OpCode::CmpIndirectY(zp) |
+            OpCode::EorIndirectY(zp) | OpCode::LdaIndirectY(zp) | OpCode::OraIndirectY(zp) |
+            OpCode::SbcIndirectY(zp) => {
+                let lo = memory.read(zp as u16) as u16;
+                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
+                let base = (hi << 8) | lo;
+                if (base & 0xFF00) != (base.wrapping_add(self.y as u16) & 0xFF00) { 1 } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
     /// Resolve the operand to a value: for immediate mode returns the operand
     /// directly, for memory-addressing modes reads the byte at the effective address.
     fn resolve<M: Memory>(&self, op: &OpCode, memory: &mut M) -> u8 {
@@ -1021,53 +1050,28 @@ impl Cpu {
             OpCode::SedImplied => { self.status.set(DECIMAL, true); }
 
             // Branch Instructions — all relative addressing
-            // Offset is a signed i8; extra cycle if taken, another if page crossed
-            OpCode::BplRelative(off) => {
-                if !self.status.get(NEGATIVE) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1; // TODO: +1 more if page cross
-                }
-            }
-            OpCode::BmiRelative(off) => {
-                if self.status.get(NEGATIVE) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BvcRelative(off) => {
-                if !self.status.get(OVERFLOW) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BvsRelative(off) => {
-                if self.status.get(OVERFLOW) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BccRelative(off) => {
-                if !self.status.get(CARRY) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BcsRelative(off) => {
-                if self.status.get(CARRY) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BneRelative(off) => {
-                if !self.status.get(ZERO) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
-                }
-            }
-            OpCode::BeqRelative(off) => {
-                if self.status.get(ZERO) {
-                    self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
-                    return details.cycle_count + 1;
+            // +1 cycle if taken, +1 more if target crosses a page boundary
+            OpCode::BplRelative(off) | OpCode::BmiRelative(off) |
+            OpCode::BvcRelative(off) | OpCode::BvsRelative(off) |
+            OpCode::BccRelative(off) | OpCode::BcsRelative(off) |
+            OpCode::BneRelative(off) | OpCode::BeqRelative(off) => {
+                let taken = match op {
+                    OpCode::BplRelative(_) => !self.status.get(NEGATIVE),
+                    OpCode::BmiRelative(_) =>  self.status.get(NEGATIVE),
+                    OpCode::BvcRelative(_) => !self.status.get(OVERFLOW),
+                    OpCode::BvsRelative(_) =>  self.status.get(OVERFLOW),
+                    OpCode::BccRelative(_) => !self.status.get(CARRY),
+                    OpCode::BcsRelative(_) =>  self.status.get(CARRY),
+                    OpCode::BneRelative(_) => !self.status.get(ZERO),
+                    OpCode::BeqRelative(_) =>  self.status.get(ZERO),
+                    _ => unreachable!(),
+                };
+                if taken {
+                    let next_pc = self.pc.wrapping_add(op.size());
+                    let target = next_pc.wrapping_add(off as i8 as u16);
+                    let page_cross = (next_pc & 0xFF00) != (target & 0xFF00);
+                    self.pc = target;
+                    return details.cycle_count + 1 + page_cross as u8;
                 }
             }
 
@@ -1075,8 +1079,14 @@ impl Cpu {
             OpCode::NopImplied => {}
         }
 
+        let penalty = if details.extra_cycle_on_page_bound_cross {
+            self.page_cross_penalty(&op, memory)
+        } else {
+            0
+        };
+
         self.pc += op.size();
-        details.cycle_count
+        details.cycle_count + penalty
     }
 }
 
