@@ -173,7 +173,7 @@ impl HeadlessTia {
     pub fn skip_to_scanline_end(&mut self) -> u16 {
         let cpu_cycles = self.cycles_until_scanline_end();
         if cpu_cycles > 0 {
-            self.clock = 0;
+            self.clock = 228; // set to boundary so end_scanline wraps to 0
             self.end_scanline();
         }
         cpu_cycles
@@ -181,7 +181,7 @@ impl HeadlessTia {
 
     #[inline]
     fn end_scanline(&mut self) {
-        self.clock -= 228;
+        self.clock = self.clock.wrapping_sub(228);
         self.scanline += 1;
         self.wsync = false;
 
