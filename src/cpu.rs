@@ -899,6 +899,47 @@ impl Cpu {
                 memory.write(addr, self.y);
             }
 
+            // TXS — Transfer X to Stack pointer (no flags affected)
+            OpCode::TxsImplied => {
+                self.sp = self.x;
+            }
+            // TSX — Transfer Stack pointer to X
+            OpCode::TsxImplied => {
+                self.x = self.sp;
+                self.status.zero = self.x == 0;
+                self.status.negative = self.x & 0x80 != 0;
+            }
+
+            // PHA — Push Accumulator
+            OpCode::PhaImplied => {
+                memory.write(0x0100 | self.sp as u16, self.a);
+                self.sp = self.sp.wrapping_sub(1);
+            }
+            // PLA — Pull Accumulator
+            OpCode::PlaImplied => {
+                self.sp = self.sp.wrapping_add(1);
+                self.a = memory.read(0x0100 | self.sp as u16);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // PHP — Push Processor status
+            OpCode::PhpImplied => {
+                // PHP always pushes with break and unused bits set
+                let flags = self.status.to_Byte() | 0x30;
+                memory.write(0x0100 | self.sp as u16, flags);
+                self.sp = self.sp.wrapping_sub(1);
+            }
+            // PLP — Pull Processor status
+            OpCode::PlpImplied => {
+                self.sp = self.sp.wrapping_add(1);
+                let flags = memory.read(0x0100 | self.sp as u16);
+                self.status = StatusFlags::from_Byte(flags);
+            }
+
+            // NOP
+            OpCode::NopImplied => {}
+
             _ => unimplemented!(),
         }
 
