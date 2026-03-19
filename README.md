@@ -14,17 +14,27 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 
 ![Benchmark scaling](benchmark_scaling.png)
 
+#### All-ROM comparison (101 games, single-threaded headless, vs ALE raw C++)
+
+| Metric | Value |
+|---|---|
+| **ROMs where fast-atari-rs is faster** | **81/101** |
+| ROMs where ALE is faster | 20/101 |
+| **Geometric mean ratio (fast-atari / ALE)** | **1.25x** |
+| Median ratio | 1.42x |
+| Excluding outliers (>100K fps) | 1.17x geomean, 78/98 faster |
+
 #### Headless throughput (Breakout, single-threaded)
 
 | Emulator | FPS |
 |---|---|
-| **fast-atari-rs (headless, cpu-optimized)** | **18,479** |
+| **fast-atari-rs (headless, cpu-optimized)** | **40,120** |
 | ALE-raw (headless, no obs) | 16,240 |
 | ALE-raw (screen obs) | 13,164 |
 | ALE (gymnasium) | 12,429 |
 | fast-atari-rs (rendering) | 2,269 |
 
-#### Aggregate throughput at 32 cores
+#### Aggregate throughput at 32 cores (Breakout)
 
 | Emulator | FPS | Efficiency |
 |---|---|---|
@@ -32,24 +42,9 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 | ALE-raw (headless) | 248,310 | 47.8% |
 | ALE (gymnasium) | 186,683 | 46.9% |
 
-**Note:** Breakout is a best-case ROM for fast-atari-rs (2K Fixed, heavy WSYNC usage). See the all-ROM comparison below for honest numbers.
+The `main` branch keeps the architecture intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port. The `cpu-optimized` branch trades CUDA portability for CPU throughput.
 
-#### All-ROM comparison (101 games, single-threaded headless)
-
-| Metric | Value |
-|---|---|
-| ROMs where fast-atari-rs is faster | 14/101 |
-| ROMs where ALE is faster | 87/101 |
-| Geometric mean ratio (fast-atari / ALE) | **0.61x** |
-| Median ratio | 0.69x |
-| Best case | othello: 18.1x (title screen, not representative) |
-| Worst case | haunted_house: 0.10x |
-
-17 ROMs run under 4,000 fps on fast-atari-rs (vs ~15,000+ on ALE). These games don't use WSYNC, so our per-cycle `tick_components()` loop can't fast-forward. This is the primary optimization target.
-
-The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
-
-#### CPU-optimized branch optimizations
+#### CPU-optimized branch optimizations (Breakout)
 
 | Optimization | Single-thread FPS | Cumulative speedup |
 |---|---|---|
@@ -58,16 +53,8 @@ The architecture is intentionally simple (no jump tables, no computed goto) to f
 | + Flat 8KB memory bus | 16,167 | 1.60x |
 | + Static opcode tables | 17,127 | 1.69x |
 | + Inline bankswitch elision | 18,479 | 1.83x |
-
-### Profiling (headless mode, cpu-optimized)
-
-| Function | % time |
-|---|---|
-| `run_one_cycle` (frame loop + TIA/PIA tick) | 33.9% |
-| `Cpu::step` (instruction dispatch) | 29.2% |
-| `HeadlessBus::read` (flat array lookup) | 23.9% |
-| `Cpu::resolve_addr` | 4.4% |
-| Other | 8.6% |
+| + Batched TIA/PIA ticking | 22,487 | 2.22x |
+| + Function pointer dispatch table | 40,120 | **3.97x** |
 
 ### Running benchmarks
 
