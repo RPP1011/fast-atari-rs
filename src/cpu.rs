@@ -627,13 +627,32 @@ impl Cpu {
             OpCode::AdcIndirectX(_) | OpCode::AdcIndirectY(_) => {
                 let val = self.resolve(&op, memory);
                 let carry = self.status.carry as u8;
-                let (sum1, c1) = self.a.overflowing_add(val);
-                let (sum2, c2) = sum1.overflowing_add(carry);
-                self.status.carry = c1 || c2;
-                self.status.overflow = (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0;
-                self.a = sum2;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+
+                if self.status.decimal {
+                    // BCD mode
+                    let mut lo = (self.a & 0x0F) + (val & 0x0F) + carry;
+                    if lo > 9 { lo += 6; }
+                    let mut hi = (self.a >> 4) + (val >> 4) + if lo > 0x0F { 1 } else { 0 };
+
+                    // Overflow is computed from the binary-like intermediate
+                    let bin_sum = (self.a as u16) + (val as u16) + (carry as u16);
+                    self.status.zero = (bin_sum as u8) == 0;
+                    self.status.negative = (hi & 0x08) != 0;
+                    self.status.overflow =
+                        (!(self.a ^ val) & (self.a ^ ((hi << 4) | (lo & 0x0F))) & 0x80) != 0;
+
+                    if hi > 9 { hi += 6; }
+                    self.status.carry = hi > 0x0F;
+                    self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
+                } else {
+                    let (sum1, c1) = self.a.overflowing_add(val);
+                    let (sum2, c2) = sum1.overflowing_add(carry);
+                    self.status.carry = c1 || c2;
+                    self.status.overflow = (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0;
+                    self.a = sum2;
+                    self.status.zero = self.a == 0;
+                    self.status.negative = self.a & 0x80 != 0;
+                }
             }
 
             // SBC — Subtract with Carry (borrow)
@@ -642,13 +661,30 @@ impl Cpu {
             OpCode::SbcIndirectX(_) | OpCode::SbcIndirectY(_) => {
                 let val = self.resolve(&op, memory);
                 let borrow = !self.status.carry as u8;
-                let (diff1, b1) = self.a.overflowing_sub(val);
-                let (diff2, b2) = diff1.overflowing_sub(borrow);
-                self.status.carry = !(b1 || b2);
-                self.status.overflow = ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0;
-                self.a = diff2;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+
+                if self.status.decimal {
+                    // BCD mode
+                    let mut lo = (self.a & 0x0F).wrapping_sub(val & 0x0F).wrapping_sub(borrow);
+                    let lo_borrow = if (lo as i8) < 0 { lo = lo.wrapping_sub(6); 1u8 } else { 0 };
+                    let mut hi = (self.a >> 4).wrapping_sub(val >> 4).wrapping_sub(lo_borrow);
+                    if (hi as i8) < 0 { hi = hi.wrapping_sub(6); }
+
+                    let bin_diff = (self.a as i16) - (val as i16) - (borrow as i16);
+                    self.status.carry = bin_diff >= 0;
+                    self.status.zero = (bin_diff as u8) == 0;
+                    self.status.negative = (bin_diff as u8) & 0x80 != 0;
+                    self.status.overflow =
+                        ((self.a ^ val) & (self.a ^ (bin_diff as u8)) & 0x80) != 0;
+                    self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
+                } else {
+                    let (diff1, b1) = self.a.overflowing_sub(val);
+                    let (diff2, b2) = diff1.overflowing_sub(borrow);
+                    self.status.carry = !(b1 || b2);
+                    self.status.overflow = ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0;
+                    self.a = diff2;
+                    self.status.zero = self.a == 0;
+                    self.status.negative = self.a & 0x80 != 0;
+                }
             }
 
             // AND — Bitwise AND
