@@ -509,20 +509,26 @@ impl Memory for HeadlessBus {
     fn read(&mut self, addr: u16) -> u8 {
         let a = addr & 0x1FFF;
 
-        // Fast path: bit 12 or bit 7 set → ROM or RAM (covers ~99% of reads)
+        // Fast path: bit 12 or (bit 7 set AND bit 9 clear) → ROM or RAM
         // ROM: $1000–$1FFF, RAM: $80–$FF / $180–$1FF (stack)
-        if a & 0x1080 != 0 {
+        // Excludes PIA I/O ($0280–$029F) which also has bit 7 set
+        if a & 0x1080 != 0 && (a & 0x1280) != 0x0280 {
             if a & 0x1000 != 0 && self.scheme != BankScheme::Fixed {
                 self.check_bankswitch(addr);
             }
             return self.mem[a as usize];
         }
 
-        // Slow path: TIA registers or PIA I/O (rare during execution)
-        if a & 0x200 != 0 {
+        // PIA I/O: $280–$29F (A12=0, A9=1)
+        if a & 0x1280 == 0x0280 {
             return self.pia.read(a);
         }
-        self.tia.read(a)
+
+        // TIA read registers or fallback
+        if a & 0x1080 == 0x0000 {
+            return self.tia.read(a);
+        }
+        0
     }
 
     #[inline]

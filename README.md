@@ -1,14 +1,78 @@
-The goal of this is to make a version of ALE that can run on 1M+ (aggregate) SPS on a single 4090.
+# fast-atari-rs — CUDA Persistent-Kernel Atari 2600 Emulator
 
-I am going to start with getting the CPU working in a way that transfers well to the CUDA code that I will have to write later.
+The goal is 0.5–1.5M aggregate FPS on a single RTX 4090 using persistent CUDA kernels with one Atari simulation per thread.
 
-All credit to https://github.com/Klaus2m5/6502_65C02_functional_tests for the tests. They are essential to having any idea of what is going on.
+## CUDA Architecture
 
-~~Note: Cycle count is sometimes wrong. As I am not implmenting a TIA, I will not be fixing that.~~
+Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA). State is stored in global memory (Phase 1, AoS). ROM is shared across all instances via a global memory buffer.
 
-Turns out it is really easy to fix. There is a difference between pragmatism and laziness.
+### Phase 1: Naive kernel (current) — correctness first
 
-## Benchmarks
+- One thread per instance, all state in global memory AoS
+- 149-opcode `switch(opcode)` with inline address resolution
+- Bus read/write dispatches to TIA registers, PIA RAM/IO, and bankswitched ROM
+- WSYNC fast-forward preserved from CPU implementation
+- Bankswitching: Fixed (2K/4K), F8 (8K), F6 (16K), F4 (32K)
+
+### Verification
+
+GPU output is verified against the CPU emulator after every frame:
+- 10 instances × 500 frames with varied action sequences — all 128 bytes of PIA RAM compared per frame, CPU registers spot-checked at 5 checkpoints
+- 18 instances × 100 frames with all 18 action types simultaneously — full RAM + register comparison
+
+### Phase 1 Performance (RTX 4090, Breakout)
+
+| Instances | Aggregate FPS |
+|-----------|--------------|
+| 1,000     | 40K          |
+| 5,000     | 198K         |
+| 10,000    | 265K         |
+| 50,000    | 281K         |
+
+### Planned optimizations
+
+| Phase | Description | Expected speedup |
+|-------|------------|-----------------|
+| 2 | SoA layout + registers + shared memory for PIA RAM | 3–5x |
+| 3 | Persistent kernel (state stays in registers across frames) | 1.3–1.8x |
+| 4 | Warp-level opcode sorting to reduce divergence | 1.5–2.5x |
+
+## File structure
+
+```
+cuda/
+  src/
+    atari_kernel.cu       — Frame kernel, action dispatch, frame loop
+    cpu_6502.cuh          — 149-case switch, inline address resolution
+    memory_bus.cuh        — bus_read/bus_write with TIA/PIA/ROM dispatch
+    tia_headless.cuh      — tick_n, wsync skip, register read/write
+    pia.cuh               — RAM access, timer tick_n, IO ports
+    state_layout.cuh      — AtariState struct (AoS)
+  tests/
+    test_frame.cu         — Standalone compilation test
+src/
+  cuda_env.rs             — cudarc host-side: BatchAtariGpu struct
+  lib.rs                  — pub mod cuda_env (feature-gated)
+build.rs                  — nvcc compilation to PTX
+tests/
+  test_cuda.rs            — GPU vs CPU frame comparison
+examples/
+  bench_cuda.rs           — Performance benchmark
+```
+
+## Building
+
+Requires CUDA Toolkit 12.0+ and an sm_89 GPU (RTX 4090).
+
+```bash
+# Run verification tests
+cargo test --features cuda --test test_cuda
+
+# Run performance benchmark
+cargo run --release --features cuda --example bench_cuda
+```
+
+## CPU Emulator Benchmarks
 
 ### fast-atari-rs vs ALE (Gymnasium)
 
@@ -24,16 +88,6 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 | ALE (gymnasium) | 12,429 |
 | fast-atari-rs (rendering) | 2,269 |
 
-#### Aggregate throughput at 32 cores
-
-| Emulator | FPS | Efficiency |
-|---|---|---|
-| **fast-atari-rs (headless)** | **302,948** | **51.2%** |
-| ALE-raw (headless) | 248,310 | 47.8% |
-| ALE (gymnasium) | 186,683 | 46.9% |
-
-**Note:** Breakout is a best-case ROM for fast-atari-rs (2K Fixed, heavy WSYNC usage). See the all-ROM comparison below for honest numbers.
-
 #### All-ROM comparison (101 games, single-threaded headless)
 
 | Metric | Value |
@@ -41,33 +95,8 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 | ROMs where fast-atari-rs is faster | 14/101 |
 | ROMs where ALE is faster | 87/101 |
 | Geometric mean ratio (fast-atari / ALE) | **0.61x** |
-| Median ratio | 0.69x |
-| Best case | othello: 18.1x (title screen, not representative) |
-| Worst case | haunted_house: 0.10x |
 
-17 ROMs run under 4,000 fps on fast-atari-rs (vs ~15,000+ on ALE). These games don't use WSYNC, so our per-cycle `tick_components()` loop can't fast-forward. This is the primary optimization target.
-
-The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
-
-#### CPU-optimized branch optimizations
-
-| Optimization | Single-thread FPS | Cumulative speedup |
-|---|---|---|
-| Baseline headless | 10,118 | 1.0x |
-| + WSYNC fast-forward | 12,283 | 1.21x |
-| + Flat 8KB memory bus | 16,167 | 1.60x |
-| + Static opcode tables | 17,127 | 1.69x |
-| + Inline bankswitch elision | 18,479 | 1.83x |
-
-### Profiling (headless mode, cpu-optimized)
-
-| Function | % time |
-|---|---|
-| `run_one_cycle` (frame loop + TIA/PIA tick) | 33.9% |
-| `Cpu::step` (instruction dispatch) | 29.2% |
-| `HeadlessBus::read` (flat array lookup) | 23.9% |
-| `Cpu::resolve_addr` | 4.4% |
-| Other | 8.6% |
+The architecture is intentionally simple (no jump tables, no computed goto) to facilitate the CUDA port.
 
 ### Running benchmarks
 
@@ -77,11 +106,9 @@ cargo run --release --example benchmark -- <ROM> [MAX_THREADS] [SECONDS]
 
 # All-ROM sweep (single-threaded headless)
 cargo run --release --example bench_all_roms -- roms/ [SECONDS_PER_ROM]
-python bench_all_ale.py [SECONDS_PER_ROM]
 
 # ALE comparison (requires gymnasium + ale-py in .venv)
 .venv/bin/python bench_ale.py [MAX_WORKERS] [SECONDS]
-.venv/bin/python bench_ale_raw.py [MAX_WORKERS] [SECONDS]
 
 # Generate comparison plot
 .venv/bin/python plot_benchmark.py

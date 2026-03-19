@@ -173,7 +173,7 @@ impl HeadlessTia {
     pub fn skip_to_scanline_end(&mut self) -> u16 {
         let cpu_cycles = self.cycles_until_scanline_end();
         if cpu_cycles > 0 {
-            self.clock = 0;
+            self.clock = 228; // Set to exactly 228 so end_scanline produces 0
             self.end_scanline();
         }
         cpu_cycles

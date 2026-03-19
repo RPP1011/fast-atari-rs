@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "An optimized Atari 2600 emulator with Gymnasium-compatible environment API"
 
+[features]
+cuda = ["cudarc"]
+
 [dependencies]
 coz = "0.1"
+cudarc = { version = "0.12", optional = true, features = ["cuda-12000"] }
 
 [dev-dependencies]
 png = "0.17"

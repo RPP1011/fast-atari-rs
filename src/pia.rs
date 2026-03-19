@@ -28,19 +28,19 @@ pub struct Pia {
     pub ram: [u8; 128],
 
     // I/O ports
-    port_a_output: u8,
-    port_a_ddr: u8,
-    port_a_input: u8,
+    pub port_a_output: u8,
+    pub port_a_ddr: u8,
+    pub port_a_input: u8,
 
-    port_b_output: u8,
-    port_b_ddr: u8,
-    port_b_input: u8,
+    pub port_b_output: u8,
+    pub port_b_ddr: u8,
+    pub port_b_input: u8,
 
     // Timer
-    timer_value: u16,
-    timer_prescaler: u16,
-    timer_prescaler_select: u16,
-    timer_underflow: bool,
+    pub timer_value: u16,
+    pub timer_prescaler: u16,
+    pub timer_prescaler_select: u16,
+    pub timer_underflow: bool,
 }
 
 impl Default for Pia {
