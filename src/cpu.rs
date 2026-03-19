@@ -503,6 +503,117 @@ impl Cpu {
         self.y = 0;
     }
 
+    /// Resolve the effective address for memory-addressing modes.
+    /// Returns None for immediate, implied, accumulator, and relative modes.
+    fn resolve_addr(&self, op: &OpCode, memory: &mut dyn Memory) -> Option<u16> {
+        match *op {
+            // Immediate — no address, value is the operand itself
+            OpCode::AdcImmediate(_) | OpCode::AndImmediate(_) | OpCode::CmpImmediate(_) |
+            OpCode::CpxImmediate(_) | OpCode::CpyImmediate(_) | OpCode::EorImmediate(_) |
+            OpCode::LdaImmediate(_) | OpCode::LdxImmediate(_) | OpCode::LdyImmediate(_) |
+            OpCode::OraImmediate(_) | OpCode::SbcImmediate(_) => None,
+
+            // Zero Page — operand is an 8-bit address in page zero
+            OpCode::AdcZeroPage(zp)  | OpCode::AndZeroPage(zp)  | OpCode::AslZeroPage(zp)  |
+            OpCode::BitZeroPage(zp)  | OpCode::CmpZeroPage(zp)  | OpCode::CpxZeroPage(zp)  |
+            OpCode::CpyZeroPage(zp)  | OpCode::DecZeroPage(zp)  | OpCode::EorZeroPage(zp)  |
+            OpCode::IncZeroPage(zp)  | OpCode::LdaZeroPage(zp)  | OpCode::LdxZeroPage(zp)  |
+            OpCode::LdyZeroPage(zp)  | OpCode::LsrZeroPage(zp)  | OpCode::OraZeroPage(zp)  |
+            OpCode::RolZeroPage(zp)  | OpCode::RorZeroPage(zp)  | OpCode::SbcZeroPage(zp)  |
+            OpCode::StaZeroPage(zp)  | OpCode::StxZeroPage(zp)  | OpCode::StyZeroPage(zp)  =>
+                Some(zp as u16),
+
+            // Zero Page,X — (operand + X) wrapped to page zero
+            OpCode::AdcZeroPageX(zp) | OpCode::AndZeroPageX(zp) | OpCode::AslZeroPageX(zp) |
+            OpCode::CmpZeroPageX(zp) | OpCode::DecZeroPageX(zp) | OpCode::EorZeroPageX(zp) |
+            OpCode::IncZeroPageX(zp) | OpCode::LdaZeroPageX(zp) | OpCode::LdyZeroPageX(zp) |
+            OpCode::LsrZeroPageX(zp) | OpCode::OraZeroPageX(zp) | OpCode::RolZeroPageX(zp) |
+            OpCode::RorZeroPageX(zp) | OpCode::SbcZeroPageX(zp) | OpCode::StaZeroPageX(zp) |
+            OpCode::StyZeroPageX(zp) =>
+                Some(zp.wrapping_add(self.x) as u16),
+
+            // Zero Page,Y — (operand + Y) wrapped to page zero
+            OpCode::LdxZeroPageY(zp) | OpCode::StxZeroPageY(zp) =>
+                Some(zp.wrapping_add(self.y) as u16),
+
+            // Absolute — operand is the full 16-bit address
+            OpCode::AdcAbsolute(addr)  | OpCode::AndAbsolute(addr)  | OpCode::AslAbsolute(addr)  |
+            OpCode::BitAbsolute(addr)  | OpCode::CmpAbsolute(addr)  | OpCode::CpxAbsolute(addr)  |
+            OpCode::CpyAbsolute(addr)  | OpCode::DecAbsolute(addr)  | OpCode::EorAbsolute(addr)  |
+            OpCode::IncAbsolute(addr)  | OpCode::JmpAbsolute(addr)  | OpCode::JsrAbsolute(addr)  |
+            OpCode::LdaAbsolute(addr)  | OpCode::LdxAbsolute(addr)  | OpCode::LdyAbsolute(addr)  |
+            OpCode::LsrAbsolute(addr)  | OpCode::OraAbsolute(addr)  | OpCode::RolAbsolute(addr)  |
+            OpCode::RorAbsolute(addr)  | OpCode::SbcAbsolute(addr)  | OpCode::StaAbsolute(addr)  |
+            OpCode::StxAbsolute(addr)  | OpCode::StyAbsolute(addr)  =>
+                Some(addr),
+
+            // Absolute,X — operand + X
+            OpCode::AdcAbsoluteX(addr) | OpCode::AndAbsoluteX(addr) | OpCode::AslAbsoluteX(addr) |
+            OpCode::CmpAbsoluteX(addr) | OpCode::DecAbsoluteX(addr) | OpCode::EorAbsoluteX(addr) |
+            OpCode::IncAbsoluteX(addr) | OpCode::LdaAbsoluteX(addr) | OpCode::LdyAbsoluteX(addr) |
+            OpCode::LsrAbsoluteX(addr) | OpCode::OraAbsoluteX(addr) | OpCode::RolAbsoluteX(addr) |
+            OpCode::RorAbsoluteX(addr) | OpCode::SbcAbsoluteX(addr) | OpCode::StaAbsoluteX(addr) =>
+                Some(addr.wrapping_add(self.x as u16)),
+
+            // Absolute,Y — operand + Y
+            OpCode::AdcAbsoluteY(addr) | OpCode::AndAbsoluteY(addr) | OpCode::CmpAbsoluteY(addr) |
+            OpCode::EorAbsoluteY(addr) | OpCode::LdaAbsoluteY(addr) | OpCode::LdxAbsoluteY(addr) |
+            OpCode::OraAbsoluteY(addr) | OpCode::SbcAbsoluteY(addr) | OpCode::StaAbsoluteY(addr) =>
+                Some(addr.wrapping_add(self.y as u16)),
+
+            // Indirect,X — read 16-bit address from zero page at (operand + X)
+            OpCode::AdcIndirectX(zp) | OpCode::AndIndirectX(zp) | OpCode::CmpIndirectX(zp) |
+            OpCode::EorIndirectX(zp) | OpCode::LdaIndirectX(zp) | OpCode::OraIndirectX(zp) |
+            OpCode::SbcIndirectX(zp) | OpCode::StaIndirectX(zp) => {
+                let ptr = zp.wrapping_add(self.x);
+                let lo = memory.read(ptr as u16) as u16;
+                let hi = memory.read(ptr.wrapping_add(1) as u16) as u16;
+                Some((hi << 8) | lo)
+            }
+
+            // Indirect,Y — read 16-bit address from zero page at operand, then add Y
+            OpCode::AdcIndirectY(zp) | OpCode::AndIndirectY(zp) | OpCode::CmpIndirectY(zp) |
+            OpCode::EorIndirectY(zp) | OpCode::LdaIndirectY(zp) | OpCode::OraIndirectY(zp) |
+            OpCode::SbcIndirectY(zp) | OpCode::StaIndirectY(zp) => {
+                let lo = memory.read(zp as u16) as u16;
+                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
+                Some(((hi << 8) | lo).wrapping_add(self.y as u16))
+            }
+
+            // JMP Indirect — read 16-bit address from the operand address
+            // (with the 6502 page-boundary bug)
+            OpCode::JmpIndirect(addr) => {
+                let lo = memory.read(addr) as u16;
+                // Bug: if addr is $xxFF, high byte wraps within the page
+                let hi_addr = (addr & 0xFF00) | ((addr.wrapping_add(1)) & 0x00FF);
+                let hi = memory.read(hi_addr) as u16;
+                Some((hi << 8) | lo)
+            }
+
+            // All other opcodes (implied, accumulator, relative) have no effective address
+            _ => None,
+        }
+    }
+
+    /// Resolve the operand to a value: for immediate mode returns the operand
+    /// directly, for memory-addressing modes reads the byte at the effective address.
+    fn resolve(&self, op: &OpCode, memory: &mut dyn Memory) -> u8 {
+        match *op {
+            // Immediate — the operand IS the value
+            OpCode::AdcImmediate(v) | OpCode::AndImmediate(v) | OpCode::CmpImmediate(v) |
+            OpCode::CpxImmediate(v) | OpCode::CpyImmediate(v) | OpCode::EorImmediate(v) |
+            OpCode::LdaImmediate(v) | OpCode::LdxImmediate(v) | OpCode::LdyImmediate(v) |
+            OpCode::OraImmediate(v) | OpCode::SbcImmediate(v) => v,
+
+            // Everything else — read from the effective address
+            _ => {
+                let addr = self.resolve_addr(op, memory)
+                    .expect("resolve called on opcode with no effective address");
+                memory.read(addr)
+            }
+        }
+    }
+
     /// Execute a single instruction. Returns the number of cycles consumed.
     pub fn step(&mut self, memory: &mut dyn Memory) -> u8 {
         let op = OpCode::decode(memory, self.pc)
@@ -510,18 +621,13 @@ impl Cpu {
         let details = op.details();
 
         match op {
-            OpCode::AdcImmediate(val) => {
+            // ADC — all addressing modes collapse to one operation
+            OpCode::AdcImmediate(_) | OpCode::AdcZeroPage(_) | OpCode::AdcZeroPageX(_) |
+            OpCode::AdcAbsolute(_)  | OpCode::AdcAbsoluteX(_) | OpCode::AdcAbsoluteY(_) |
+            OpCode::AdcIndirectX(_) | OpCode::AdcIndirectY(_) => {
+                let val = self.resolve(&op, memory);
                 self.a = self.a.wrapping_add(val);
-            },
-            OpCode::AdcAbsolute(val) => {
-                self.a = self.a.wrapping_add(memory.read(self.pc));
-            },
-            OpCode::AdcAbsoluteX(val) => {
-                self.a = self.a.wrapping_add(memory.read(self.pc + self.x as u16));
-            },
-            OpCode::AdcAbsoluteY(val) => {
-                self.a = self.a.wrapping_add(memory.read(self.pc + self.y as u16));
-            },
+            }
             _ => unimplemented!(),
         }
 
