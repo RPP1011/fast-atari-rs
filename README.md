@@ -14,7 +14,7 @@ Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA).
 - WSYNC fast-forward preserved from CPU implementation
 - Bankswitching: Fixed (2K/4K), F8 (8K), F6 (16K), F4 (32K)
 
-### Phase 2: Registers + shared memory (current)
+### Phase 2: Registers + shared memory (current default)
 
 - `ThreadCtx` struct holds all CPU/TIA/PIA state in GPU registers during the frame
 - PIA RAM (128 bytes per instance) lives in `__shared__` memory — eliminates global memory traffic for every stack push/pull and RAM read/write
@@ -24,56 +24,61 @@ Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA).
 ### Phase 3: Multi-frame kernel
 
 - `atari_multi_frame_kernel` runs K frames in a single kernel launch
-- State stays in registers and shared memory across all K frames — no load/store between frames
+- State stays in registers and shared memory across all K frames
 - Useful for RL training: batch K frames of pre-computed actions in one call
-- Throughput is the same as Phase 2 (per-frame load/store was already <0.1% of frame time)
+
+### Phase 4: Warp-level opcode sorting (optional)
+
+- `__ballot_sync`/`__shfl_sync` to group threads by opcode before entering the 149-case switch
+- Each unique opcode in the warp executes fully converged (no switch divergence)
+- Enabled via `gpu.set_sorted(true)` — **off by default**
+- Trades per-instruction shuffle overhead for reduced divergence
+- Helps on divergence-heavy games; hurts on WSYNC-heavy games like Breakout
 
 ### Verification
 
-GPU output is verified against the CPU emulator after every frame:
-- 10 instances × 500 frames with varied action sequences — all 128 bytes of PIA RAM compared per frame, CPU registers spot-checked at 5 checkpoints
-- 18 instances × 100 frames with all 18 action types simultaneously — full RAM + register comparison
-- Multi-frame: 10 instances × 500 frames in one kernel launch, 18 instances × 100 frames with per-instance actions
+GPU output is verified against the CPU emulator:
+- Per-frame: 10 instances × 500 frames, RAM + register comparison every frame
+- Multi-frame: 10 instances × 500 frames in one kernel launch
+- Sorted: both per-frame and multi-frame verified against CPU (500 frames + 100 frames with 18 action types)
 
 ### Performance (RTX 4090, Breakout)
 
-| Instances | Phase 1 | Phase 2 | Phase 3 (multi) |
-|-----------|---------|---------|-----------------|
-| 1,000     | 40K     | 58K     | 55K             |
-| 5,000     | 198K    | 289K    | 273K            |
-| 10,000    | 265K    | 575K    | 546K            |
-| 50,000    | 281K    | **2,185K** | **2,099K**   |
+| Instances | Phase 1 | Phase 2 | Phase 3 (multi) | Phase 4 (sorted) |
+|-----------|---------|---------|-----------------|------------------|
+| 1,000     | 40K     | 57K     | 55K             | 43K              |
+| 5,000     | 198K    | 284K    | 270K            | 220K             |
+| 10,000    | 265K    | 559K    | 531K            | 432K             |
+| 50,000    | 281K    | **2,078K** | 1,987K       | 1,734K           |
 
-vs CPU single-threaded baseline (18K FPS): **121x speedup** at 50K instances.
+Phase 4 (sorted) is slower on Breakout because WSYNC fast-forwarding dominates execution time (low divergence). On games without WSYNC (where the 149-case switch serializes 12+ divergent opcode paths per warp), sorting is expected to help.
 
-### Planned optimizations
-
-| Phase | Description | Expected speedup |
-|-------|------------|-----------------|
-| 4 | Warp-level opcode sorting to reduce divergence | 1.5–2.5x |
+vs CPU single-threaded baseline (18K FPS): **115x speedup** at 50K instances.
 
 ## File structure
 
 ```
 cuda/
   src/
-    atari_kernel.cu       — Per-frame + multi-frame kernels
+    atari_kernel.cu       — Per-frame, multi-frame, and sorted kernel variants
     cpu_6502.cuh          — 149-case switch, inline address resolution
     memory_bus.cuh        — bus_read/bus_write with TIA/PIA/ROM dispatch
     tia_headless.cuh      — tick_n, wsync skip, register read/write
     pia.cuh               — RAM in shared memory, timer tick_n, IO ports
     state_layout.cuh      — AtariState (global), ThreadCtx (registers), load/store
+    opcode_sort.cuh       — Warp shuffle compaction for opcode grouping
   tests/
     test_frame.cu         — Standalone compilation test
 src/
-  cuda_env.rs             — cudarc host-side: BatchAtariGpu with step() and step_multi()
+  cuda_env.rs             — cudarc host-side: BatchAtariGpu with step/step_multi/set_sorted
   lib.rs                  — pub mod cuda_env (feature-gated)
 build.rs                  — nvcc compilation to PTX
 tests/
   test_cuda.rs            — GPU vs CPU per-frame comparison
   test_cuda_persistent.rs — GPU vs CPU multi-frame comparison
+  test_cuda_sorted.rs     — GPU vs CPU sorted kernel comparison
 examples/
-  bench_cuda.rs           — Performance benchmark (Phase 2 vs Phase 3)
+  bench_cuda.rs           — Performance benchmark (all phases)
 ```
 
 ## Building
@@ -81,9 +86,8 @@ examples/
 Requires CUDA Toolkit 12.0+ and an sm_89 GPU (RTX 4090).
 
 ```bash
-# Run verification tests
-cargo test --release --features cuda --test test_cuda
-cargo test --release --features cuda --test test_cuda_persistent
+# Run all verification tests
+cargo test --release --features cuda
 
 # Run performance benchmark
 cargo run --release --features cuda --example bench_cuda

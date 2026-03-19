@@ -105,6 +105,7 @@ pub struct BatchAtariGpu {
     d_obs: CudaSlice<u8>,
     d_rom: CudaSlice<u8>,
     rom_len: u32,
+    sorted: bool,
 }
 
 impl BatchAtariGpu {
@@ -113,15 +114,19 @@ impl BatchAtariGpu {
         let ptx = include_str!(concat!(env!("OUT_DIR"), "/atari_kernel.ptx"));
         dev.load_ptx(
             cudarc::nvrtc::Ptx::from_src(ptx), "atari",
-            &["atari_frame_kernel", "atari_multi_frame_kernel"],
+            &["atari_frame_kernel", "atari_multi_frame_kernel",
+              "atari_frame_kernel_sorted", "atari_multi_frame_kernel_sorted"],
         )?;
         let rom_len = rom.len() as u32;
         let d_rom = dev.htod_copy(rom.clone())?;
         let d_states = dev.alloc_zeros::<AtariStateGpu>(n)?;
         let d_actions = dev.alloc_zeros::<u8>(n)?;
         let d_obs = dev.alloc_zeros::<u8>(n * 128)?;
-        Ok(Self { dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len })
+        Ok(Self { dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len, sorted: false })
     }
+
+    /// Enable Phase 4 warp-level opcode sorting.
+    pub fn set_sorted(&mut self, sorted: bool) { self.sorted = sorted; }
 
     pub fn reset(&mut self) -> Result<Vec<Vec<u8>>, DriverError> {
         let mut gpu_states = Vec::with_capacity(self.n);
@@ -144,7 +149,8 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let func = self.dev.get_func("atari", "atari_frame_kernel").unwrap();
+        let name = if self.sorted { "atari_frame_kernel_sorted" } else { "atari_frame_kernel" };
+        let func = self.dev.get_func("atari", name).unwrap();
         unsafe {
             func.launch(cfg, (
                 &mut self.d_states, &self.d_actions, &mut self.d_obs,
@@ -166,7 +172,8 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let func = self.dev.get_func("atari", "atari_multi_frame_kernel").unwrap();
+        let name = if self.sorted { "atari_multi_frame_kernel_sorted" } else { "atari_multi_frame_kernel" };
+        let func = self.dev.get_func("atari", name).unwrap();
         unsafe {
             func.launch(cfg, (
                 &mut self.d_states, &d_actions_multi, &mut self.d_obs,

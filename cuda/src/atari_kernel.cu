@@ -1,4 +1,10 @@
 #include "cpu_6502.cuh"
+#include "opcode_sort.cuh"
+
+// NOTE: Opcode sorting (Phase 4) adds warp shuffle overhead per instruction.
+// It helps on divergence-heavy games (no WSYNC) but hurts on WSYNC-heavy games
+// like Breakout where most cycles are in the fast-forward path.
+// Use set_sorted(true) selectively based on ROM characteristics.
 
 // ============================================================
 // Action dispatch
@@ -28,6 +34,7 @@ void apply_action(ThreadCtx* c, uint8_t action) {
 // ============================================================
 // Run one cycle
 // ============================================================
+// Unsorted version (Phase 2 compatibility)
 __device__ __forceinline__
 void run_one_cycle(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
                    const uint8_t* rp, uint32_t rl) {
@@ -37,6 +44,22 @@ void run_one_cycle(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
         *cycles += skipped;
     } else {
         uint8_t cy = cpu_step(c, mr, rp, rl);
+        *cycles += cy;
+        tia_tick_n(c, cy);
+        pia_tick_n(c, (uint16_t)cy);
+    }
+}
+
+// Sorted version (Phase 4 — warp opcode compaction)
+__device__ __forceinline__
+void run_one_cycle_sorted(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
+                          const uint8_t* rp, uint32_t rl) {
+    if (c->tia_wsync) {
+        uint16_t skipped = tia_skip_to_scanline_end(c);
+        pia_tick_n(c, skipped);
+        *cycles += skipped;
+    } else {
+        uint8_t cy = cpu_step_sorted(c, mr, rp, rl);
         *cycles += cy;
         tia_tick_n(c, cy);
         pia_tick_n(c, (uint16_t)cy);
@@ -56,6 +79,21 @@ void run_frame(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
 
     while (!(c->tia_vsync & 0x02)) {
         run_one_cycle(c, mr, &cycles, rp, rl);
+        if (cycles > 100000) break;
+    }
+}
+
+// Sorted version (Phase 4)
+__device__
+void run_frame_sorted(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
+    c->tia_frame_complete = 0;
+    uint64_t cycles = 0;
+
+    while (c->tia_vsync & 0x02)
+        run_one_cycle_sorted(c, mr, &cycles, rp, rl);
+
+    while (!(c->tia_vsync & 0x02)) {
+        run_one_cycle_sorted(c, mr, &cycles, rp, rl);
         if (cycles > 100000) break;
     }
 }
@@ -146,6 +184,68 @@ void atari_multi_frame_kernel(
     for (int i = 0; i < 128; i++) {
         uint8_t v = my_ram[i];
         gram_out[i] = v;
+        obs[i] = v;
+    }
+}
+
+// ============================================================
+// Phase 4: Sorted variants (warp opcode compaction)
+// ============================================================
+extern "C"
+__global__
+void atari_frame_kernel_sorted(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,
+    uint8_t* __restrict__ obs_out,
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    uint8_t* my_ram = sram[threadIdx.x];
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+    for (int i = 0; i < 128; i++) my_ram[i] = states[idx].ram[i];
+    apply_action(&ctx, actions[idx]);
+    run_frame_sorted(&ctx, my_ram, rom_ptr, rom_len);
+    store_ctx(&states[idx], &ctx);
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        states[idx].ram[i] = v;
+        obs[i] = v;
+    }
+}
+
+extern "C"
+__global__
+void atari_multi_frame_kernel_sorted(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,
+    uint8_t* __restrict__ obs_out,
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    int K,
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    uint8_t* my_ram = sram[threadIdx.x];
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+    for (int i = 0; i < 128; i++) my_ram[i] = states[idx].ram[i];
+    for (int f = 0; f < K; f++) {
+        apply_action(&ctx, actions[f * N + idx]);
+        run_frame_sorted(&ctx, my_ram, rom_ptr, rom_len);
+    }
+    store_ctx(&states[idx], &ctx);
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        states[idx].ram[i] = v;
         obs[i] = v;
     }
 }
