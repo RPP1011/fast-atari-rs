@@ -937,6 +937,65 @@ impl Cpu {
                 self.status = StatusFlags::from_Byte(flags);
             }
 
+            // JMP — Jump (absolute and indirect)
+            OpCode::JmpAbsolute(_) | OpCode::JmpIndirect(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                // JMP sets PC directly — skip the normal pc += size advance
+                self.pc = addr;
+                return details.cycle_count;
+            }
+
+            // JSR — Jump to Subroutine (push return addr - 1, then jump)
+            OpCode::JsrAbsolute(addr) => {
+                let ret = self.pc + 2; // points to last byte of JSR instruction
+                memory.write(0x0100 | self.sp as u16, (ret >> 8) as u8);
+                self.sp = self.sp.wrapping_sub(1);
+                memory.write(0x0100 | self.sp as u16, ret as u8);
+                self.sp = self.sp.wrapping_sub(1);
+                self.pc = addr;
+                return details.cycle_count;
+            }
+
+            // RTS — Return from Subroutine
+            OpCode::RtsImplied => {
+                self.sp = self.sp.wrapping_add(1);
+                let lo = memory.read(0x0100 | self.sp as u16) as u16;
+                self.sp = self.sp.wrapping_add(1);
+                let hi = memory.read(0x0100 | self.sp as u16) as u16;
+                self.pc = ((hi << 8) | lo).wrapping_add(1);
+                return details.cycle_count;
+            }
+
+            // RTI — Return from Interrupt
+            OpCode::RtiImplied => {
+                self.sp = self.sp.wrapping_add(1);
+                let flags = memory.read(0x0100 | self.sp as u16);
+                self.status = StatusFlags::from_Byte(flags);
+                self.sp = self.sp.wrapping_add(1);
+                let lo = memory.read(0x0100 | self.sp as u16) as u16;
+                self.sp = self.sp.wrapping_add(1);
+                let hi = memory.read(0x0100 | self.sp as u16) as u16;
+                self.pc = (hi << 8) | lo;
+                return details.cycle_count;
+            }
+
+            // BRK — Force Interrupt
+            OpCode::BrkImplied => {
+                let ret = self.pc + 2; // BRK skips the byte after it
+                memory.write(0x0100 | self.sp as u16, (ret >> 8) as u8);
+                self.sp = self.sp.wrapping_sub(1);
+                memory.write(0x0100 | self.sp as u16, ret as u8);
+                self.sp = self.sp.wrapping_sub(1);
+                let flags = self.status.to_Byte() | 0x30; // set break + unused
+                memory.write(0x0100 | self.sp as u16, flags);
+                self.sp = self.sp.wrapping_sub(1);
+                self.status.interrupt_disable = true;
+                let lo = memory.read(0xFFFE) as u16;
+                let hi = memory.read(0xFFFF) as u16;
+                self.pc = (hi << 8) | lo;
+                return details.cycle_count;
+            }
+
             // NOP
             OpCode::NopImplied => {}
 
