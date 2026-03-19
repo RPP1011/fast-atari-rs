@@ -45,11 +45,11 @@ pub struct OpCodeDetails {
 }
 
 macro_rules! opcodes {
-    ($( $variant:ident = $hex:expr => ($pc:expr, $cc:expr, $ec:expr) ),* $(,)?) => {
+    ($( $(#[$meta:meta])* $variant:ident = $hex:expr => ($pc:expr, $cc:expr, $ec:expr) ),* $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(u8)]
         pub enum OpCode {
-            $( $variant = $hex ),*
+            $( $(#[$meta])* $variant = $hex ),*
         }
 
         impl OpCode {
