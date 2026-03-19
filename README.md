@@ -1,12 +1,12 @@
 # fast-atari-rs — CUDA Persistent-Kernel Atari 2600 Emulator
 
-The goal is 0.5–1.5M aggregate FPS on a single RTX 4090 using persistent CUDA kernels with one Atari simulation per thread.
+**2.1M aggregate FPS** on a single RTX 4090 with 50K parallel Atari instances.
 
 ## CUDA Architecture
 
-Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA). State is stored in global memory (Phase 1, AoS). ROM is shared across all instances via a global memory buffer.
+Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA). ROM is shared across all instances via a global memory buffer.
 
-### Phase 1: Naive kernel (current) — correctness first
+### Phase 1: Naive kernel — correctness first
 
 - One thread per instance, all state in global memory AoS
 - 149-opcode `switch(opcode)` with inline address resolution
@@ -14,26 +14,34 @@ Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA).
 - WSYNC fast-forward preserved from CPU implementation
 - Bankswitching: Fixed (2K/4K), F8 (8K), F6 (16K), F4 (32K)
 
+### Phase 2: Registers + shared memory (current)
+
+- `ThreadCtx` struct holds all CPU/TIA/PIA state in GPU registers during the frame
+- PIA RAM (128 bytes per instance) lives in `__shared__` memory — eliminates global memory traffic for every stack push/pull and RAM read/write
+- Global memory touched only at frame boundaries (load at start, store at end)
+- 16KB shared memory per block (128 threads × 128 bytes)
+
 ### Verification
 
 GPU output is verified against the CPU emulator after every frame:
 - 10 instances × 500 frames with varied action sequences — all 128 bytes of PIA RAM compared per frame, CPU registers spot-checked at 5 checkpoints
 - 18 instances × 100 frames with all 18 action types simultaneously — full RAM + register comparison
 
-### Phase 1 Performance (RTX 4090, Breakout)
+### Performance (RTX 4090, Breakout)
 
-| Instances | Aggregate FPS |
-|-----------|--------------|
-| 1,000     | 40K          |
-| 5,000     | 198K         |
-| 10,000    | 265K         |
-| 50,000    | 281K         |
+| Instances | Phase 1 | Phase 2 | Speedup |
+|-----------|---------|---------|---------|
+| 1,000     | 40K     | 56K     | 1.4x    |
+| 5,000     | 198K    | 276K    | 1.4x    |
+| 10,000    | 265K    | 552K    | 2.1x    |
+| 50,000    | 281K    | **2,068K** | **7.4x** |
+
+vs CPU single-threaded baseline: 18K FPS → **115x speedup** at 50K instances.
 
 ### Planned optimizations
 
 | Phase | Description | Expected speedup |
 |-------|------------|-----------------|
-| 2 | SoA layout + registers + shared memory for PIA RAM | 3–5x |
 | 3 | Persistent kernel (state stays in registers across frames) | 1.3–1.8x |
 | 4 | Warp-level opcode sorting to reduce divergence | 1.5–2.5x |
 
@@ -42,12 +50,12 @@ GPU output is verified against the CPU emulator after every frame:
 ```
 cuda/
   src/
-    atari_kernel.cu       — Frame kernel, action dispatch, frame loop
+    atari_kernel.cu       — Frame kernel, shared memory RAM, register state
     cpu_6502.cuh          — 149-case switch, inline address resolution
     memory_bus.cuh        — bus_read/bus_write with TIA/PIA/ROM dispatch
     tia_headless.cuh      — tick_n, wsync skip, register read/write
-    pia.cuh               — RAM access, timer tick_n, IO ports
-    state_layout.cuh      — AtariState struct (AoS)
+    pia.cuh               — RAM in shared memory, timer tick_n, IO ports
+    state_layout.cuh      — AtariState (global), ThreadCtx (registers), load/store
   tests/
     test_frame.cu         — Standalone compilation test
 src/

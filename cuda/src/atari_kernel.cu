@@ -1,84 +1,68 @@
 #include "cpu_6502.cuh"
 
 // ============================================================
-// Action dispatch — translate action byte to PIA/TIA inputs
+// Action dispatch
 // ============================================================
 __device__ __forceinline__
-void apply_action(AtariState* s, uint8_t action) {
-    bool up = false, down = false, left = false, right = false, fire = false;
+void apply_action(ThreadCtx* c, uint8_t action) {
+    bool up=false, dn=false, lt=false, rt=false, fi=false;
     switch (action) {
-        case 0:  break;
-        case 1:  fire = true; break;
-        case 2:  up = true; break;
-        case 3:  right = true; break;
-        case 4:  left = true; break;
-        case 5:  down = true; break;
-        case 6:  up = true; right = true; break;
-        case 7:  up = true; left = true; break;
-        case 8:  down = true; right = true; break;
-        case 9:  down = true; left = true; break;
-        case 10: up = true; fire = true; break;
-        case 11: right = true; fire = true; break;
-        case 12: left = true; fire = true; break;
-        case 13: down = true; fire = true; break;
-        case 14: up = true; right = true; fire = true; break;
-        case 15: up = true; left = true; fire = true; break;
-        case 16: down = true; right = true; fire = true; break;
-        case 17: down = true; left = true; fire = true; break;
+        case 0: break; case 1: fi=true; break;
+        case 2: up=true; break; case 3: rt=true; break;
+        case 4: lt=true; break; case 5: dn=true; break;
+        case 6: up=true;rt=true; break; case 7: up=true;lt=true; break;
+        case 8: dn=true;rt=true; break; case 9: dn=true;lt=true; break;
+        case 10: up=true;fi=true; break; case 11: rt=true;fi=true; break;
+        case 12: lt=true;fi=true; break; case 13: dn=true;fi=true; break;
+        case 14: up=true;rt=true;fi=true; break; case 15: up=true;lt=true;fi=true; break;
+        case 16: dn=true;rt=true;fi=true; break; case 17: dn=true;lt=true;fi=true; break;
     }
-
     uint8_t swcha = 0xFF;
-    if (up)    swcha &= ~0x10;
-    if (down)  swcha &= ~0x20;
-    if (left)  swcha &= ~0x40;
-    if (right) swcha &= ~0x80;
-    s->port_a_input = swcha;
-
-    s->inpt4 = fire ? 0 : 1;
-    s->paddle0 = left ? 200 : (right ? 50 : 128);
+    if (up) swcha &= ~0x10; if (dn) swcha &= ~0x20;
+    if (lt) swcha &= ~0x40; if (rt) swcha &= ~0x80;
+    c->port_a_input = swcha;
+    c->inpt4 = fi ? 0 : 1;
+    c->paddle0 = lt ? 200 : (rt ? 50 : 128);
 }
 
 // ============================================================
-// Run one emulation cycle (WSYNC fast-forward or CPU step + tick)
+// Run one cycle
 // ============================================================
 __device__ __forceinline__
-void run_one_cycle(AtariState* s, uint64_t* cycles, const uint8_t* rom_ptr, uint32_t rom_len) {
-    if (s->tia_wsync) {
-        uint16_t skipped = tia_skip_to_scanline_end(s);
-        pia_tick_n(s, skipped);
+void run_one_cycle(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
+                   const uint8_t* rp, uint32_t rl) {
+    if (c->tia_wsync) {
+        uint16_t skipped = tia_skip_to_scanline_end(c);
+        pia_tick_n(c, skipped);
         *cycles += skipped;
     } else {
-        uint8_t c = cpu_step(s, rom_ptr, rom_len);
-        *cycles += c;
-        tia_tick_n(s, c);
-        pia_tick_n(s, (uint16_t)c);
+        uint8_t cy = cpu_step(c, mr, rp, rl);
+        *cycles += cy;
+        tia_tick_n(c, cy);
+        pia_tick_n(c, (uint16_t)cy);
     }
 }
 
 // ============================================================
-// Run one frame (until VSYNC triggers)
+// Run one frame
 // ============================================================
 __device__
-uint64_t run_frame(AtariState* s, const uint8_t* rom_ptr, uint32_t rom_len) {
-    s->tia_frame_complete = 0;
+uint64_t run_frame(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
+    c->tia_frame_complete = 0;
     uint64_t cycles = 0;
 
-    // Phase 1: If currently in VSYNC, run until it ends
-    while (s->tia_vsync & 0x02) {
-        run_one_cycle(s, &cycles, rom_ptr, rom_len);
-    }
+    while (c->tia_vsync & 0x02)
+        run_one_cycle(c, mr, &cycles, rp, rl);
 
-    // Phase 2: Run until next VSYNC starts
-    while (!(s->tia_vsync & 0x02)) {
-        run_one_cycle(s, &cycles, rom_ptr, rom_len);
+    while (!(c->tia_vsync & 0x02)) {
+        run_one_cycle(c, mr, &cycles, rp, rl);
         if (cycles > 100000) break;
     }
-
     return cycles;
 }
 
 // ============================================================
-// Main kernel: one thread per Atari instance
+// Main kernel: shared memory for RAM, registers for CPU state
 // ============================================================
 extern "C"
 __global__
@@ -90,20 +74,40 @@ void atari_frame_kernel(
     uint32_t rom_len,
     int N
 ) {
+    // Shared memory for PIA RAM: [thread][byte]
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    AtariState* s = &states[idx];
+    // Pointer to this thread's 128-byte RAM in shared memory
+    uint8_t* my_ram = sram[threadIdx.x];
+
+    // Load state from global → registers
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+
+    // Load RAM from global → shared
+    const uint8_t* gram = states[idx].ram;
+    for (int i = 0; i < 128; i++) {
+        my_ram[i] = gram[i];
+    }
 
     // Apply action
-    apply_action(s, actions[idx]);
+    apply_action(&ctx, actions[idx]);
 
-    // Run one frame
-    run_frame(s, rom_ptr, rom_len);
+    // Run one frame (all in registers + shared memory)
+    run_frame(&ctx, my_ram, rom_ptr, rom_len);
 
-    // Copy PIA RAM to observation buffer
+    // Store registers → global
+    store_ctx(&states[idx], &ctx);
+
+    // Store RAM: shared → global + observation buffer
+    uint8_t* gram_out = states[idx].ram;
     uint8_t* obs = &obs_out[idx * 128];
     for (int i = 0; i < 128; i++) {
-        obs[i] = s->ram[i];
+        uint8_t v = my_ram[i];
+        gram_out[i] = v;
+        obs[i] = v;
     }
 }

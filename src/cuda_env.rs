@@ -240,8 +240,6 @@ pub struct BatchAtariGpu {
     d_obs: CudaSlice<u8>,
     d_rom: CudaSlice<u8>,
     rom_len: u32,
-    // CPU-side reference emulators (for reset)
-    cpu_emus: Vec<HeadlessAtari>,
 }
 
 impl BatchAtariGpu {
@@ -266,11 +264,6 @@ impl BatchAtariGpu {
         let d_actions = dev.alloc_zeros::<u8>(n)?;
         let d_obs = dev.alloc_zeros::<u8>(n * 128)?;
 
-        // Create CPU reference emulators
-        let cpu_emus: Vec<HeadlessAtari> = (0..n)
-            .map(|_| HeadlessAtari::new(rom.clone()))
-            .collect();
-
         Ok(Self {
             dev,
             n,
@@ -280,25 +273,24 @@ impl BatchAtariGpu {
             d_obs,
             d_rom,
             rom_len,
-            cpu_emus,
         })
     }
 
-    /// Reset all instances: run CPU emulators for one frame, copy state to GPU.
+    /// Reset all instances: create one CPU emulator at a time, copy state to GPU.
+    /// This avoids holding N HeadlessAtari instances in memory simultaneously.
     pub fn reset(&mut self) -> Result<Vec<Vec<u8>>, DriverError> {
-        for emu in &mut self.cpu_emus {
-            *emu = HeadlessAtari::new(self.rom.clone());
+        let mut gpu_states = Vec::with_capacity(self.n);
+        let mut obs = Vec::with_capacity(self.n);
+
+        for _ in 0..self.n {
+            let mut emu = HeadlessAtari::new(self.rom.clone());
             emu.run_frame();
+            obs.push(emu.ram().to_vec());
+            gpu_states.push(AtariStateGpu::from_headless(&emu));
+            // emu is dropped here — no accumulation
         }
 
-        let gpu_states: Vec<AtariStateGpu> = self.cpu_emus.iter()
-            .map(|e| AtariStateGpu::from_headless(e))
-            .collect();
         self.dev.htod_copy_into(gpu_states, &mut self.d_states)?;
-
-        let obs: Vec<Vec<u8>> = self.cpu_emus.iter()
-            .map(|e| e.ram().to_vec())
-            .collect();
         Ok(obs)
     }
 
