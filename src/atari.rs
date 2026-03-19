@@ -1,6 +1,7 @@
 /// Atari 2600 console — ties CPU, TIA, PIA, and cartridge ROM together.
 
 use crate::cpu::{Cpu, Memory};
+use crate::dispatch;
 use crate::env::{Env, StepInfo};
 use crate::headless_tia::HeadlessTia;
 use crate::pia::Pia;
@@ -468,6 +469,12 @@ impl HeadlessBus {
         self.mem[0x180..0x200].copy_from_slice(&self.pia.ram);
     }
 
+    /// Fast opcode fetch — reads directly from flat memory, no dispatch.
+    #[inline]
+    pub fn read_opcode(&self, pc: u16) -> u8 {
+        self.mem[pc as usize & 0x1FFF]
+    }
+
     #[inline]
     fn check_bankswitch(&mut self, addr: u16) {
         let a = addr & 0x1FFF;
@@ -562,6 +569,7 @@ impl Memory for HeadlessBus {
 pub struct HeadlessAtari {
     pub cpu: Cpu,
     pub bus: HeadlessBus,
+    dispatch: [fn(&mut Cpu, &mut HeadlessBus) -> u8; 256],
 }
 
 impl HeadlessAtari {
@@ -569,6 +577,7 @@ impl HeadlessAtari {
         let mut console = Self {
             cpu: Cpu::new(),
             bus: HeadlessBus::new(rom),
+            dispatch: dispatch::dispatch_table(),
         };
         console.cpu.reset(&mut console.bus);
         console
@@ -606,14 +615,14 @@ impl HeadlessAtari {
     #[inline]
     fn run_one_cycle(&mut self, cycles: &mut u64) {
         if self.bus.tia.wsync {
-            // Fast-forward to end of scanline instead of ticking one cycle at a time
             let skipped = self.bus.tia.skip_to_scanline_end();
             self.bus.pia.tick_n(skipped);
             *cycles += skipped as u64;
         } else {
-            let c = self.cpu.step(&mut self.bus);
+            // Dispatch table: one indirect call, no enum decode/match chain
+            let opcode = self.bus.read_opcode(self.cpu.pc);
+            let c = self.dispatch[opcode as usize](&mut self.cpu, &mut self.bus);
             *cycles += c as u64;
-            // Batch-advance TIA and PIA instead of per-cycle loop
             self.bus.tia.tick_n(c);
             self.bus.pia.tick_n(c as u16);
         }
