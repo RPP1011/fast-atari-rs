@@ -96,6 +96,13 @@ impl AtariStateGpu {
 // ============================================================
 // Batch GPU Atari environment (per-frame kernel, Phase 2)
 // ============================================================
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KernelVariant {
+    Default,
+    Sorted,
+    Ldg,
+}
+
 pub struct BatchAtariGpu {
     dev: Arc<CudaDevice>,
     n: usize,
@@ -105,7 +112,7 @@ pub struct BatchAtariGpu {
     d_obs: CudaSlice<u8>,
     d_rom: CudaSlice<u8>,
     rom_len: u32,
-    sorted: bool,
+    variant: KernelVariant,
 }
 
 impl BatchAtariGpu {
@@ -115,18 +122,24 @@ impl BatchAtariGpu {
         dev.load_ptx(
             cudarc::nvrtc::Ptx::from_src(ptx), "atari",
             &["atari_frame_kernel", "atari_multi_frame_kernel",
-              "atari_frame_kernel_sorted", "atari_multi_frame_kernel_sorted"],
+              "atari_frame_kernel_sorted", "atari_multi_frame_kernel_sorted",
+              "atari_frame_kernel_ldg"],
         )?;
         let rom_len = rom.len() as u32;
         let d_rom = dev.htod_copy(rom.clone())?;
         let d_states = dev.alloc_zeros::<AtariStateGpu>(n)?;
         let d_actions = dev.alloc_zeros::<u8>(n)?;
         let d_obs = dev.alloc_zeros::<u8>(n * 128)?;
-        Ok(Self { dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len, sorted: false })
+        Ok(Self { dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len, variant: KernelVariant::Default })
     }
 
-    /// Enable Phase 4 warp-level opcode sorting.
-    pub fn set_sorted(&mut self, sorted: bool) { self.sorted = sorted; }
+    /// Set kernel variant.
+    pub fn set_variant(&mut self, v: KernelVariant) { self.variant = v; }
+
+    /// Convenience: enable sorted mode.
+    pub fn set_sorted(&mut self, sorted: bool) {
+        self.variant = if sorted { KernelVariant::Sorted } else { KernelVariant::Default };
+    }
 
     pub fn reset(&mut self) -> Result<Vec<Vec<u8>>, DriverError> {
         let mut gpu_states = Vec::with_capacity(self.n);
@@ -149,7 +162,11 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let name = if self.sorted { "atari_frame_kernel_sorted" } else { "atari_frame_kernel" };
+        let name = match self.variant {
+            KernelVariant::Default => "atari_frame_kernel",
+            KernelVariant::Sorted => "atari_frame_kernel_sorted",
+            KernelVariant::Ldg => "atari_frame_kernel_ldg",
+        };
         let func = self.dev.get_func("atari", name).unwrap();
         unsafe {
             func.launch(cfg, (
@@ -172,7 +189,10 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let name = if self.sorted { "atari_multi_frame_kernel_sorted" } else { "atari_multi_frame_kernel" };
+        let name = match self.variant {
+            KernelVariant::Sorted => "atari_multi_frame_kernel_sorted",
+            _ => "atari_multi_frame_kernel",
+        };
         let func = self.dev.get_func("atari", name).unwrap();
         unsafe {
             func.launch(cfg, (

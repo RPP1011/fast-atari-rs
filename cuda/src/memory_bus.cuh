@@ -3,15 +3,17 @@
 #include "tia_headless.cuh"
 #include "pia.cuh"
 
-// Read from ROM bank.
+// Read from ROM bank. Uses __ldg() to route through read-only texture cache,
+// avoiding coherency overhead and enabling L1/L2 caching of hot ROM regions.
 __device__ __forceinline__
-uint8_t rom_read(const ThreadCtx* c, uint16_t addr, const uint8_t* rom_ptr, uint32_t rom_len) {
+uint8_t rom_read(const ThreadCtx* c, uint16_t addr,
+                 const uint8_t* __restrict__ rom_ptr, uint32_t rom_len) {
     uint16_t a = addr & 0x0FFF;
     if (c->scheme == BANK_FIXED) {
-        return rom_ptr[a % rom_len];
+        return __ldg(&rom_ptr[a % rom_len]);
     }
     uint32_t offset = (uint32_t)c->bank * 4096 + a;
-    if (offset < rom_len) return rom_ptr[offset];
+    if (offset < rom_len) return __ldg(&rom_ptr[offset]);
     return 0;
 }
 

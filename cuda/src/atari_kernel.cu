@@ -249,3 +249,48 @@ void atari_multi_frame_kernel_sorted(
         obs[i] = v;
     }
 }
+
+// ============================================================
+
+// ============================================================
+// Phase 5: __ldg() state load + read-only ROM cache
+// Same as atari_frame_kernel but uses __ldg() for state load
+// and const __restrict__ ROM pointer for texture cache routing.
+// ============================================================
+extern "C"
+__global__
+void atari_frame_kernel_ldg(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,
+    uint8_t* __restrict__ obs_out,
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    uint8_t* my_ram = sram[threadIdx.x];
+
+    // Load state with __ldg() through read-only cache
+    ThreadCtx ctx;
+    load_ctx_ldg(&ctx, &states[idx]);
+
+    // Load RAM with __ldg()
+    const uint8_t* gram = states[idx].ram;
+    for (int i = 0; i < 128; i++) my_ram[i] = __ldg(&gram[i]);
+
+    apply_action(&ctx, actions[idx]);
+    run_frame(&ctx, my_ram, rom_ptr, rom_len);
+
+    store_ctx(&states[idx], &ctx);
+    uint8_t* gram_out = states[idx].ram;
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        gram_out[i] = v;
+        obs[i] = v;
+    }
+}
