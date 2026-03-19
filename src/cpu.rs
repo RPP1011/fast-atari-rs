@@ -833,6 +833,72 @@ impl Cpu {
                 self.status.negative = val & 0x80 != 0;
             }
 
+            // TAX — Transfer A to X
+            OpCode::TaxImplied => {
+                self.x = self.a;
+                self.status.zero = self.x == 0;
+                self.status.negative = self.x & 0x80 != 0;
+            }
+            // TXA — Transfer X to A
+            OpCode::TxaImplied => {
+                self.a = self.x;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+            // TAY — Transfer A to Y
+            OpCode::TayImplied => {
+                self.y = self.a;
+                self.status.zero = self.y == 0;
+                self.status.negative = self.y & 0x80 != 0;
+            }
+            // TYA — Transfer Y to A
+            OpCode::TyaImplied => {
+                self.a = self.y;
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+
+            // LDA — Load Accumulator
+            OpCode::LdaImmediate(_) | OpCode::LdaZeroPage(_) | OpCode::LdaZeroPageX(_) |
+            OpCode::LdaAbsolute(_)  | OpCode::LdaAbsoluteX(_) | OpCode::LdaAbsoluteY(_) |
+            OpCode::LdaIndirectX(_) | OpCode::LdaIndirectY(_) => {
+                self.a = self.resolve(&op, memory);
+                self.status.zero = self.a == 0;
+                self.status.negative = self.a & 0x80 != 0;
+            }
+            // LDX — Load X register
+            OpCode::LdxImmediate(_) | OpCode::LdxZeroPage(_) | OpCode::LdxZeroPageY(_) |
+            OpCode::LdxAbsolute(_)  | OpCode::LdxAbsoluteY(_) => {
+                self.x = self.resolve(&op, memory);
+                self.status.zero = self.x == 0;
+                self.status.negative = self.x & 0x80 != 0;
+            }
+            // LDY — Load Y register
+            OpCode::LdyImmediate(_) | OpCode::LdyZeroPage(_) | OpCode::LdyZeroPageX(_) |
+            OpCode::LdyAbsolute(_)  | OpCode::LdyAbsoluteX(_) => {
+                self.y = self.resolve(&op, memory);
+                self.status.zero = self.y == 0;
+                self.status.negative = self.y & 0x80 != 0;
+            }
+
+            // STA — Store Accumulator
+            OpCode::StaZeroPage(_) | OpCode::StaZeroPageX(_) |
+            OpCode::StaAbsolute(_) | OpCode::StaAbsoluteX(_) | OpCode::StaAbsoluteY(_) |
+            OpCode::StaIndirectX(_) | OpCode::StaIndirectY(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                memory.write(addr, self.a);
+            }
+            // STX — Store X register
+            OpCode::StxZeroPage(_) | OpCode::StxZeroPageY(_) | OpCode::StxAbsolute(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                memory.write(addr, self.x);
+            }
+            // STY — Store Y register
+            OpCode::StyZeroPage(_) | OpCode::StyZeroPageX(_) | OpCode::StyAbsolute(_) => {
+                let addr = self.resolve_addr(&op, memory).unwrap();
+                memory.write(addr, self.y);
+            }
+
             _ => unimplemented!(),
         }
 
