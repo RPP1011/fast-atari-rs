@@ -88,7 +88,7 @@ macro_rules! opcodes {
         }
 
         impl OpCode {
-            pub fn decode(memory: &mut dyn Memory, pc: u16) -> Option<Self> {
+            pub fn decode<M: Memory>(memory: &mut M, pc: u16) -> Option<Self> {
                 let byte = memory.read(pc);
                 match byte {
                     $( $hex => Some(opcodes!(@decode $variant, $($operand,)? memory, pc)), )*
@@ -500,7 +500,7 @@ impl Cpu {
     }
 
     /// Reset the CPU, reading the reset vector from memory.
-    pub fn reset(&mut self, memory: &mut dyn Memory) {
+    pub fn reset<M: Memory>(&mut self, memory: &mut M) {
         let lo = memory.read(0xFFFC) as u16;
         let hi = memory.read(0xFFFD) as u16;
         self.pc = (hi << 8) | lo;
@@ -513,7 +513,7 @@ impl Cpu {
 
     /// Resolve the effective address for memory-addressing modes.
     /// Returns None for immediate, implied, accumulator, and relative modes.
-    fn resolve_addr(&self, op: &OpCode, memory: &mut dyn Memory) -> Option<u16> {
+    fn resolve_addr<M: Memory>(&self, op: &OpCode, memory: &mut M) -> Option<u16> {
         match *op {
             // Immediate — no address, value is the operand itself
             OpCode::AdcImmediate(_) | OpCode::AndImmediate(_) | OpCode::CmpImmediate(_) |
@@ -605,7 +605,7 @@ impl Cpu {
 
     /// Resolve the operand to a value: for immediate mode returns the operand
     /// directly, for memory-addressing modes reads the byte at the effective address.
-    fn resolve(&self, op: &OpCode, memory: &mut dyn Memory) -> u8 {
+    fn resolve<M: Memory>(&self, op: &OpCode, memory: &mut M) -> u8 {
         match *op {
             // Immediate — the operand IS the value
             OpCode::AdcImmediate(v) | OpCode::AndImmediate(v) | OpCode::CmpImmediate(v) |
@@ -623,7 +623,7 @@ impl Cpu {
     }
 
     /// Execute a single instruction. Returns the number of cycles consumed.
-    pub fn step(&mut self, memory: &mut dyn Memory) -> u8 {
+    pub fn step<M: Memory>(&mut self, memory: &mut M) -> u8 {
         let op = OpCode::decode(memory, self.pc)
             .unwrap_or_else(|| panic!("illegal opcode: 0x{:02X} at PC=0x{:04X}", memory.read(self.pc), self.pc));
         let details = op.details();
