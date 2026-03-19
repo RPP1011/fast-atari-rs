@@ -5,6 +5,11 @@ edition = "2024"
 description = "An optimized Atari 2600 emulator with Gymnasium-compatible environment API"
 
 [dependencies]
+rl4burn-core = { git = "https://github.com/RPP1011/rl4burn", optional = true }
 
 [dev-dependencies]
 png = "0.17"
+
+[features]
+default = []
+rl4burn = ["rl4burn-core"]
