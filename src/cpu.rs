@@ -1,40 +1,48 @@
 /// OpCode : http://www.6502.org/tutorials/6502opcodes.html
 
 
-/// 6502 CPU status flags.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StatusFlags {
-    pub carry: bool,
-    pub zero: bool,
-    pub interrupt_disable: bool,
-    pub decimal: bool,
-    pub break_command: bool,
-    pub overflow: bool,
-    pub negative: bool,
+/// 6502 CPU status flags packed into a single byte.
+/// Bit layout: NV-BDIZC (bit 5 is unused, always set on push).
+macro_rules! flags {
+    ($($name:ident = $bit:expr),* $(,)?) => {
+        $(pub const $name: u8 = 1 << $bit;)*
+    };
 }
 
-impl StatusFlags {
-    pub fn to_byte(self) -> u8 {
-        (self.carry as u8)
-            | ((self.zero as u8) << 1)
-            | ((self.interrupt_disable as u8) << 2)
-            | ((self.decimal as u8) << 3)
-            | ((self.break_command as u8) << 4)
-            | (1 << 5) // unused, always set
-            | ((self.overflow as u8) << 6)
-            | ((self.negative as u8) << 7)
+flags! {
+    CARRY     = 0,
+    ZERO      = 1,
+    INTERRUPT = 2,
+    DECIMAL   = 3,
+    BREAK     = 4,
+    UNUSED    = 5,
+    OVERFLOW  = 6,
+    NEGATIVE  = 7,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Status(pub u8);
+
+impl Status {
+    /// Pack for push (always set BREAK and UNUSED bits).
+    pub fn to_byte_with_break(self) -> u8 {
+        self.0 | BREAK | UNUSED
     }
 
-    pub fn from_Byte(Byte: u8) -> Self {
-        Self {
-            carry: Byte & 0x01 != 0,
-            zero: Byte & 0x02 != 0,
-            interrupt_disable: Byte & 0x04 != 0,
-            decimal: Byte & 0x08 != 0,
-            break_command: Byte & 0x10 != 0,
-            overflow: Byte & 0x40 != 0,
-            negative: Byte & 0x80 != 0,
-        }
+    /// Restore from a pulled byte (BREAK and UNUSED are ignored on pull).
+    pub fn from_byte(byte: u8) -> Self {
+        Self(byte & !(BREAK | UNUSED))
+    }
+
+    #[inline] pub fn set(&mut self, flag: u8, on: bool) {
+        if on { self.0 |= flag; } else { self.0 &= !flag; }
+    }
+    #[inline] pub fn get(self, flag: u8) -> bool { self.0 & flag != 0 }
+
+    /// Set ZERO and NEGATIVE from a result byte.
+    #[inline] pub fn set_zn(&mut self, val: u8) {
+        self.set(ZERO, val == 0);
+        self.set(NEGATIVE, val & 0x80 != 0);
     }
 }
 
@@ -467,7 +475,7 @@ pub struct Cpu {
     /// Program counter
     pub pc: u16,
     /// Processor status flags
-    pub status: StatusFlags,
+    pub status: Status,
     /// Total cycles executed
     pub cycles: u64,
 }
@@ -480,7 +488,7 @@ impl Default for Cpu {
             y: 0,
             sp: 0xFD,
             pc: 0,
-            status: StatusFlags::default(),
+            status: Status::default(),
             cycles: 0,
         }
     }
@@ -497,7 +505,7 @@ impl Cpu {
         let hi = memory.read(0xFFFD) as u16;
         self.pc = (hi << 8) | lo;
         self.sp = 0xFD;
-        self.status = StatusFlags::default();
+        self.status = Status::default();
         self.a = 0;
         self.x = 0;
         self.y = 0;
@@ -626,9 +634,9 @@ impl Cpu {
             OpCode::AdcAbsolute(_)  | OpCode::AdcAbsoluteX(_) | OpCode::AdcAbsoluteY(_) |
             OpCode::AdcIndirectX(_) | OpCode::AdcIndirectY(_) => {
                 let val = self.resolve(&op, memory);
-                let carry = self.status.carry as u8;
+                let carry = self.status.get(CARRY) as u8;
 
-                if self.status.decimal {
+                if self.status.get(DECIMAL) {
                     // BCD mode
                     let mut lo = (self.a & 0x0F) + (val & 0x0F) + carry;
                     if lo > 9 { lo += 6; }
@@ -636,22 +644,21 @@ impl Cpu {
 
                     // Overflow is computed from the binary-like intermediate
                     let bin_sum = (self.a as u16) + (val as u16) + (carry as u16);
-                    self.status.zero = (bin_sum as u8) == 0;
-                    self.status.negative = (hi & 0x08) != 0;
-                    self.status.overflow =
-                        (!(self.a ^ val) & (self.a ^ ((hi << 4) | (lo & 0x0F))) & 0x80) != 0;
+                    self.status.set(ZERO, (bin_sum as u8) == 0);
+                    self.status.set(NEGATIVE, (hi & 0x08) != 0);
+                    self.status.set(OVERFLOW,
+                        (!(self.a ^ val) & (self.a ^ ((hi << 4) | (lo & 0x0F))) & 0x80) != 0);
 
                     if hi > 9 { hi += 6; }
-                    self.status.carry = hi > 0x0F;
+                    self.status.set(CARRY, hi > 0x0F);
                     self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
                 } else {
                     let (sum1, c1) = self.a.overflowing_add(val);
                     let (sum2, c2) = sum1.overflowing_add(carry);
-                    self.status.carry = c1 || c2;
-                    self.status.overflow = (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0;
+                    self.status.set(CARRY, c1 || c2);
+                    self.status.set(OVERFLOW, (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0);
                     self.a = sum2;
-                    self.status.zero = self.a == 0;
-                    self.status.negative = self.a & 0x80 != 0;
+                    self.status.set_zn(self.a);
                 }
             }
 
@@ -660,9 +667,9 @@ impl Cpu {
             OpCode::SbcAbsolute(_)  | OpCode::SbcAbsoluteX(_) | OpCode::SbcAbsoluteY(_) |
             OpCode::SbcIndirectX(_) | OpCode::SbcIndirectY(_) => {
                 let val = self.resolve(&op, memory);
-                let borrow = !self.status.carry as u8;
+                let borrow = !self.status.get(CARRY) as u8;
 
-                if self.status.decimal {
+                if self.status.get(DECIMAL) {
                     // BCD mode
                     let mut lo = (self.a & 0x0F).wrapping_sub(val & 0x0F).wrapping_sub(borrow);
                     let lo_borrow = if (lo as i8) < 0 { lo = lo.wrapping_sub(6); 1u8 } else { 0 };
@@ -670,20 +677,19 @@ impl Cpu {
                     if (hi as i8) < 0 { hi = hi.wrapping_sub(6); }
 
                     let bin_diff = (self.a as i16) - (val as i16) - (borrow as i16);
-                    self.status.carry = bin_diff >= 0;
-                    self.status.zero = (bin_diff as u8) == 0;
-                    self.status.negative = (bin_diff as u8) & 0x80 != 0;
-                    self.status.overflow =
-                        ((self.a ^ val) & (self.a ^ (bin_diff as u8)) & 0x80) != 0;
+                    self.status.set(CARRY, bin_diff >= 0);
+                    self.status.set(ZERO, (bin_diff as u8) == 0);
+                    self.status.set(NEGATIVE, (bin_diff as u8) & 0x80 != 0);
+                    self.status.set(OVERFLOW,
+                        ((self.a ^ val) & (self.a ^ (bin_diff as u8)) & 0x80) != 0);
                     self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
                 } else {
                     let (diff1, b1) = self.a.overflowing_sub(val);
                     let (diff2, b2) = diff1.overflowing_sub(borrow);
-                    self.status.carry = !(b1 || b2);
-                    self.status.overflow = ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0;
+                    self.status.set(CARRY, !(b1 || b2));
+                    self.status.set(OVERFLOW, ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0);
                     self.a = diff2;
-                    self.status.zero = self.a == 0;
-                    self.status.negative = self.a & 0x80 != 0;
+                    self.status.set_zn(self.a);
                 }
             }
 
@@ -692,8 +698,7 @@ impl Cpu {
             OpCode::AndAbsolute(_)  | OpCode::AndAbsoluteX(_) | OpCode::AndAbsoluteY(_) |
             OpCode::AndIndirectX(_) | OpCode::AndIndirectY(_) => {
                 self.a &= self.resolve(&op, memory);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
 
             // ORA — Bitwise OR
@@ -701,8 +706,7 @@ impl Cpu {
             OpCode::OraAbsolute(_)  | OpCode::OraAbsoluteX(_) | OpCode::OraAbsoluteY(_) |
             OpCode::OraIndirectX(_) | OpCode::OraIndirectY(_) => {
                 self.a |= self.resolve(&op, memory);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
 
             // EOR — Bitwise Exclusive OR
@@ -710,8 +714,7 @@ impl Cpu {
             OpCode::EorAbsolute(_)  | OpCode::EorAbsoluteX(_) | OpCode::EorAbsoluteY(_) |
             OpCode::EorIndirectX(_) | OpCode::EorIndirectY(_) => {
                 self.a ^= self.resolve(&op, memory);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
 
             // CMP — Compare accumulator
@@ -720,27 +723,24 @@ impl Cpu {
             OpCode::CmpIndirectX(_) | OpCode::CmpIndirectY(_) => {
                 let val = self.resolve(&op, memory);
                 let result = self.a.wrapping_sub(val);
-                self.status.carry = self.a >= val;
-                self.status.zero = result == 0;
-                self.status.negative = result & 0x80 != 0;
+                self.status.set(CARRY, self.a >= val);
+                self.status.set_zn(result);
             }
 
             // CPX — Compare X register
             OpCode::CpxImmediate(_) | OpCode::CpxZeroPage(_) | OpCode::CpxAbsolute(_) => {
                 let val = self.resolve(&op, memory);
                 let result = self.x.wrapping_sub(val);
-                self.status.carry = self.x >= val;
-                self.status.zero = result == 0;
-                self.status.negative = result & 0x80 != 0;
+                self.status.set(CARRY, self.x >= val);
+                self.status.set_zn(result);
             }
 
             // CPY — Compare Y register
             OpCode::CpyImmediate(_) | OpCode::CpyZeroPage(_) | OpCode::CpyAbsolute(_) => {
                 let val = self.resolve(&op, memory);
                 let result = self.y.wrapping_sub(val);
-                self.status.carry = self.y >= val;
-                self.status.zero = result == 0;
-                self.status.negative = result & 0x80 != 0;
+                self.status.set(CARRY, self.y >= val);
+                self.status.set_zn(result);
             }
 
             // INC — Increment memory
@@ -749,8 +749,7 @@ impl Cpu {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let val = memory.read(addr).wrapping_add(1);
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set_zn(val);
             }
 
             // DEC — Decrement memory
@@ -759,139 +758,124 @@ impl Cpu {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let val = memory.read(addr).wrapping_sub(1);
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set_zn(val);
             }
 
             // INX / INY / DEX / DEY — Register increment/decrement
             OpCode::InxImplied => {
                 self.x = self.x.wrapping_add(1);
-                self.status.zero = self.x == 0;
-                self.status.negative = self.x & 0x80 != 0;
+                self.status.set_zn(self.x);
             }
             OpCode::InyImplied => {
                 self.y = self.y.wrapping_add(1);
-                self.status.zero = self.y == 0;
-                self.status.negative = self.y & 0x80 != 0;
+                self.status.set_zn(self.y);
             }
             OpCode::DexImplied => {
                 self.x = self.x.wrapping_sub(1);
-                self.status.zero = self.x == 0;
-                self.status.negative = self.x & 0x80 != 0;
+                self.status.set_zn(self.x);
             }
             OpCode::DeyImplied => {
                 self.y = self.y.wrapping_sub(1);
-                self.status.zero = self.y == 0;
-                self.status.negative = self.y & 0x80 != 0;
+                self.status.set_zn(self.y);
             }
 
             // ASL — Arithmetic Shift Left
             OpCode::AslAccumulator => {
-                self.status.carry = self.a & 0x80 != 0;
+                self.status.set(CARRY, self.a & 0x80 != 0);
                 self.a <<= 1;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
             OpCode::AslZeroPage(_) | OpCode::AslZeroPageX(_) |
             OpCode::AslAbsolute(_) | OpCode::AslAbsoluteX(_) => {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let mut val = memory.read(addr);
-                self.status.carry = val & 0x80 != 0;
+                self.status.set(CARRY, val & 0x80 != 0);
                 val <<= 1;
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set_zn(val);
             }
 
             // LSR — Logical Shift Right
             OpCode::LsrAccumulator => {
-                self.status.carry = self.a & 0x01 != 0;
+                self.status.set(CARRY, self.a & 0x01 != 0);
                 self.a >>= 1;
-                self.status.zero = self.a == 0;
-                self.status.negative = false;
+                self.status.set(ZERO, self.a == 0);
+                self.status.set(NEGATIVE, false);
             }
             OpCode::LsrZeroPage(_) | OpCode::LsrZeroPageX(_) |
             OpCode::LsrAbsolute(_) | OpCode::LsrAbsoluteX(_) => {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let mut val = memory.read(addr);
-                self.status.carry = val & 0x01 != 0;
+                self.status.set(CARRY, val & 0x01 != 0);
                 val >>= 1;
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = false;
+                self.status.set(ZERO, val == 0);
+                self.status.set(NEGATIVE, false);
             }
 
             // ROL — Rotate Left
             OpCode::RolAccumulator => {
-                let old_carry = self.status.carry as u8;
-                self.status.carry = self.a & 0x80 != 0;
+                let old_carry = self.status.get(CARRY) as u8;
+                self.status.set(CARRY, self.a & 0x80 != 0);
                 self.a = (self.a << 1) | old_carry;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
             OpCode::RolZeroPage(_) | OpCode::RolZeroPageX(_) |
             OpCode::RolAbsolute(_) | OpCode::RolAbsoluteX(_) => {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let mut val = memory.read(addr);
-                let old_carry = self.status.carry as u8;
-                self.status.carry = val & 0x80 != 0;
+                let old_carry = self.status.get(CARRY) as u8;
+                self.status.set(CARRY, val & 0x80 != 0);
                 val = (val << 1) | old_carry;
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set_zn(val);
             }
 
             // ROR — Rotate Right
             OpCode::RorAccumulator => {
-                let old_carry = self.status.carry as u8;
-                self.status.carry = self.a & 0x01 != 0;
+                let old_carry = self.status.get(CARRY) as u8;
+                self.status.set(CARRY, self.a & 0x01 != 0);
                 self.a = (self.a >> 1) | (old_carry << 7);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
             OpCode::RorZeroPage(_) | OpCode::RorZeroPageX(_) |
             OpCode::RorAbsolute(_) | OpCode::RorAbsoluteX(_) => {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 let mut val = memory.read(addr);
-                let old_carry = self.status.carry as u8;
-                self.status.carry = val & 0x01 != 0;
+                let old_carry = self.status.get(CARRY) as u8;
+                self.status.set(CARRY, val & 0x01 != 0);
                 val = (val >> 1) | (old_carry << 7);
                 memory.write(addr, val);
-                self.status.zero = val == 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set_zn(val);
             }
 
             // BIT — Test bits
             OpCode::BitZeroPage(_) | OpCode::BitAbsolute(_) => {
                 let val = self.resolve(&op, memory);
-                self.status.zero = (self.a & val) == 0;
-                self.status.overflow = val & 0x40 != 0;
-                self.status.negative = val & 0x80 != 0;
+                self.status.set(ZERO, (self.a & val) == 0);
+                self.status.set(OVERFLOW, val & 0x40 != 0);
+                self.status.set(NEGATIVE, val & 0x80 != 0);
             }
 
             // TAX — Transfer A to X
             OpCode::TaxImplied => {
                 self.x = self.a;
-                self.status.zero = self.x == 0;
-                self.status.negative = self.x & 0x80 != 0;
+                self.status.set_zn(self.x);
             }
             // TXA — Transfer X to A
             OpCode::TxaImplied => {
                 self.a = self.x;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
             // TAY — Transfer A to Y
             OpCode::TayImplied => {
                 self.y = self.a;
-                self.status.zero = self.y == 0;
-                self.status.negative = self.y & 0x80 != 0;
+                self.status.set_zn(self.y);
             }
             // TYA — Transfer Y to A
             OpCode::TyaImplied => {
                 self.a = self.y;
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
 
             // LDA — Load Accumulator
@@ -899,22 +883,19 @@ impl Cpu {
             OpCode::LdaAbsolute(_)  | OpCode::LdaAbsoluteX(_) | OpCode::LdaAbsoluteY(_) |
             OpCode::LdaIndirectX(_) | OpCode::LdaIndirectY(_) => {
                 self.a = self.resolve(&op, memory);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
             // LDX — Load X register
             OpCode::LdxImmediate(_) | OpCode::LdxZeroPage(_) | OpCode::LdxZeroPageY(_) |
             OpCode::LdxAbsolute(_)  | OpCode::LdxAbsoluteY(_) => {
                 self.x = self.resolve(&op, memory);
-                self.status.zero = self.x == 0;
-                self.status.negative = self.x & 0x80 != 0;
+                self.status.set_zn(self.x);
             }
             // LDY — Load Y register
             OpCode::LdyImmediate(_) | OpCode::LdyZeroPage(_) | OpCode::LdyZeroPageX(_) |
             OpCode::LdyAbsolute(_)  | OpCode::LdyAbsoluteX(_) => {
                 self.y = self.resolve(&op, memory);
-                self.status.zero = self.y == 0;
-                self.status.negative = self.y & 0x80 != 0;
+                self.status.set_zn(self.y);
             }
 
             // STA — Store Accumulator
@@ -942,8 +923,7 @@ impl Cpu {
             // TSX — Transfer Stack pointer to X
             OpCode::TsxImplied => {
                 self.x = self.sp;
-                self.status.zero = self.x == 0;
-                self.status.negative = self.x & 0x80 != 0;
+                self.status.set_zn(self.x);
             }
 
             // PHA — Push Accumulator
@@ -955,14 +935,13 @@ impl Cpu {
             OpCode::PlaImplied => {
                 self.sp = self.sp.wrapping_add(1);
                 self.a = memory.read(0x0100 | self.sp as u16);
-                self.status.zero = self.a == 0;
-                self.status.negative = self.a & 0x80 != 0;
+                self.status.set_zn(self.a);
             }
 
             // PHP — Push Processor status
             OpCode::PhpImplied => {
                 // PHP always pushes with break and unused bits set
-                let flags = self.status.to_byte() | 0x30;
+                let flags = self.status.to_byte_with_break();
                 memory.write(0x0100 | self.sp as u16, flags);
                 self.sp = self.sp.wrapping_sub(1);
             }
@@ -970,7 +949,7 @@ impl Cpu {
             OpCode::PlpImplied => {
                 self.sp = self.sp.wrapping_add(1);
                 let flags = memory.read(0x0100 | self.sp as u16);
-                self.status = StatusFlags::from_Byte(flags);
+                self.status = Status::from_byte(flags);
             }
 
             // JMP — Jump (absolute and indirect)
@@ -1006,7 +985,7 @@ impl Cpu {
             OpCode::RtiImplied => {
                 self.sp = self.sp.wrapping_add(1);
                 let flags = memory.read(0x0100 | self.sp as u16);
-                self.status = StatusFlags::from_Byte(flags);
+                self.status = Status::from_byte(flags);
                 self.sp = self.sp.wrapping_add(1);
                 let lo = memory.read(0x0100 | self.sp as u16) as u16;
                 self.sp = self.sp.wrapping_add(1);
@@ -1022,10 +1001,10 @@ impl Cpu {
                 self.sp = self.sp.wrapping_sub(1);
                 memory.write(0x0100 | self.sp as u16, ret as u8);
                 self.sp = self.sp.wrapping_sub(1);
-                let flags = self.status.to_byte() | 0x30; // set break + unused
+                let flags = self.status.to_byte_with_break(); // set break + unused
                 memory.write(0x0100 | self.sp as u16, flags);
                 self.sp = self.sp.wrapping_sub(1);
-                self.status.interrupt_disable = true;
+                self.status.set(INTERRUPT, true);
                 let lo = memory.read(0xFFFE) as u16;
                 let hi = memory.read(0xFFFF) as u16;
                 self.pc = (hi << 8) | lo;
@@ -1033,60 +1012,60 @@ impl Cpu {
             }
 
             // Flag Instructions
-            OpCode::ClcImplied => { self.status.carry = false; }
-            OpCode::SecImplied => { self.status.carry = true; }
-            OpCode::CliImplied => { self.status.interrupt_disable = false; }
-            OpCode::SeiImplied => { self.status.interrupt_disable = true; }
-            OpCode::ClvImplied => { self.status.overflow = false; }
-            OpCode::CldImplied => { self.status.decimal = false; }
-            OpCode::SedImplied => { self.status.decimal = true; }
+            OpCode::ClcImplied => { self.status.set(CARRY, false); }
+            OpCode::SecImplied => { self.status.set(CARRY, true); }
+            OpCode::CliImplied => { self.status.set(INTERRUPT, false); }
+            OpCode::SeiImplied => { self.status.set(INTERRUPT, true); }
+            OpCode::ClvImplied => { self.status.set(OVERFLOW, false); }
+            OpCode::CldImplied => { self.status.set(DECIMAL, false); }
+            OpCode::SedImplied => { self.status.set(DECIMAL, true); }
 
             // Branch Instructions — all relative addressing
             // Offset is a signed i8; extra cycle if taken, another if page crossed
             OpCode::BplRelative(off) => {
-                if !self.status.negative {
+                if !self.status.get(NEGATIVE) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1; // TODO: +1 more if page cross
                 }
             }
             OpCode::BmiRelative(off) => {
-                if self.status.negative {
+                if self.status.get(NEGATIVE) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BvcRelative(off) => {
-                if !self.status.overflow {
+                if !self.status.get(OVERFLOW) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BvsRelative(off) => {
-                if self.status.overflow {
+                if self.status.get(OVERFLOW) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BccRelative(off) => {
-                if !self.status.carry {
+                if !self.status.get(CARRY) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BcsRelative(off) => {
-                if self.status.carry {
+                if self.status.get(CARRY) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BneRelative(off) => {
-                if !self.status.zero {
+                if !self.status.get(ZERO) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
             }
             OpCode::BeqRelative(off) => {
-                if self.status.zero {
+                if self.status.get(ZERO) {
                     self.pc = self.pc.wrapping_add(op.size()).wrapping_add(off as i8 as u16);
                     return details.cycle_count + 1;
                 }
