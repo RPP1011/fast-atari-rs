@@ -33,6 +33,16 @@ def main():
             ale = ale_py.ALEInterface()
             ale.setInt("random_seed", 0)
             ale.setLoggerMode(ale_py.LoggerMode.Error)
+            # isSupportedROM returns false for some ROMs (e.g. combat)
+            if not ale.isSupportedROM(rom_path):
+                print("UNSUPPORTED")
+                results.append({
+                    "rom": name,
+                    "rom_size": rom_size,
+                    "status": "unsupported",
+                    "fps": 0,
+                })
+                continue
             ale.loadROM(rom_path)
             ale.reset_game()
 

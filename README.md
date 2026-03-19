@@ -32,7 +32,22 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 | ALE-raw (headless) | 248,310 | 47.8% |
 | ALE (gymnasium) | 186,683 | 46.9% |
 
-fast-atari-rs headless is **1.14x faster** than ALE's raw C++ core single-threaded, and **1.22x faster** at 32 cores. The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
+**Note:** Breakout is a best-case ROM for fast-atari-rs (2K Fixed, heavy WSYNC usage). See the all-ROM comparison below for honest numbers.
+
+#### All-ROM comparison (101 games, single-threaded headless)
+
+| Metric | Value |
+|---|---|
+| ROMs where fast-atari-rs is faster | 14/101 |
+| ROMs where ALE is faster | 87/101 |
+| Geometric mean ratio (fast-atari / ALE) | **0.61x** |
+| Median ratio | 0.69x |
+| Best case | othello: 18.1x (title screen, not representative) |
+| Worst case | haunted_house: 0.10x |
+
+17 ROMs run under 4,000 fps on fast-atari-rs (vs ~15,000+ on ALE). These games don't use WSYNC, so our per-cycle `tick_components()` loop can't fast-forward. This is the primary optimization target.
+
+The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
 
 #### CPU-optimized branch optimizations
 
@@ -59,6 +74,10 @@ fast-atari-rs headless is **1.14x faster** than ALE's raw C++ core single-thread
 ```bash
 # fast-atari-rs scaling benchmark (rendering + headless)
 cargo run --release --example benchmark -- <ROM> [MAX_THREADS] [SECONDS]
+
+# All-ROM sweep (single-threaded headless)
+cargo run --release --example bench_all_roms -- roms/ [SECONDS_PER_ROM]
+python bench_all_ale.py [SECONDS_PER_ROM]
 
 # ALE comparison (requires gymnasium + ale-py in .venv)
 .venv/bin/python bench_ale.py [MAX_WORKERS] [SECONDS]
