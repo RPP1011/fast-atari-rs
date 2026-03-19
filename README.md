@@ -21,28 +21,35 @@ Each CUDA thread runs a complete Atari 2600 instance (CPU + headless TIA + PIA).
 - Global memory touched only at frame boundaries (load at start, store at end)
 - 16KB shared memory per block (128 threads × 128 bytes)
 
+### Phase 3: Multi-frame kernel
+
+- `atari_multi_frame_kernel` runs K frames in a single kernel launch
+- State stays in registers and shared memory across all K frames — no load/store between frames
+- Useful for RL training: batch K frames of pre-computed actions in one call
+- Throughput is the same as Phase 2 (per-frame load/store was already <0.1% of frame time)
+
 ### Verification
 
 GPU output is verified against the CPU emulator after every frame:
 - 10 instances × 500 frames with varied action sequences — all 128 bytes of PIA RAM compared per frame, CPU registers spot-checked at 5 checkpoints
 - 18 instances × 100 frames with all 18 action types simultaneously — full RAM + register comparison
+- Multi-frame: 10 instances × 500 frames in one kernel launch, 18 instances × 100 frames with per-instance actions
 
 ### Performance (RTX 4090, Breakout)
 
-| Instances | Phase 1 | Phase 2 | Speedup |
-|-----------|---------|---------|---------|
-| 1,000     | 40K     | 56K     | 1.4x    |
-| 5,000     | 198K    | 276K    | 1.4x    |
-| 10,000    | 265K    | 552K    | 2.1x    |
-| 50,000    | 281K    | **2,068K** | **7.4x** |
+| Instances | Phase 1 | Phase 2 | Phase 3 (multi) |
+|-----------|---------|---------|-----------------|
+| 1,000     | 40K     | 58K     | 55K             |
+| 5,000     | 198K    | 289K    | 273K            |
+| 10,000    | 265K    | 575K    | 546K            |
+| 50,000    | 281K    | **2,185K** | **2,099K**   |
 
-vs CPU single-threaded baseline: 18K FPS → **115x speedup** at 50K instances.
+vs CPU single-threaded baseline (18K FPS): **121x speedup** at 50K instances.
 
 ### Planned optimizations
 
 | Phase | Description | Expected speedup |
 |-------|------------|-----------------|
-| 3 | Persistent kernel (state stays in registers across frames) | 1.3–1.8x |
 | 4 | Warp-level opcode sorting to reduce divergence | 1.5–2.5x |
 
 ## File structure
@@ -50,7 +57,7 @@ vs CPU single-threaded baseline: 18K FPS → **115x speedup** at 50K instances.
 ```
 cuda/
   src/
-    atari_kernel.cu       — Frame kernel, shared memory RAM, register state
+    atari_kernel.cu       — Per-frame + multi-frame kernels
     cpu_6502.cuh          — 149-case switch, inline address resolution
     memory_bus.cuh        — bus_read/bus_write with TIA/PIA/ROM dispatch
     tia_headless.cuh      — tick_n, wsync skip, register read/write
@@ -59,13 +66,14 @@ cuda/
   tests/
     test_frame.cu         — Standalone compilation test
 src/
-  cuda_env.rs             — cudarc host-side: BatchAtariGpu struct
+  cuda_env.rs             — cudarc host-side: BatchAtariGpu with step() and step_multi()
   lib.rs                  — pub mod cuda_env (feature-gated)
 build.rs                  — nvcc compilation to PTX
 tests/
-  test_cuda.rs            — GPU vs CPU frame comparison
+  test_cuda.rs            — GPU vs CPU per-frame comparison
+  test_cuda_persistent.rs — GPU vs CPU multi-frame comparison
 examples/
-  bench_cuda.rs           — Performance benchmark
+  bench_cuda.rs           — Performance benchmark (Phase 2 vs Phase 3)
 ```
 
 ## Building
@@ -74,7 +82,8 @@ Requires CUDA Toolkit 12.0+ and an sm_89 GPU (RTX 4090).
 
 ```bash
 # Run verification tests
-cargo test --features cuda --test test_cuda
+cargo test --release --features cuda --test test_cuda
+cargo test --release --features cuda --test test_cuda_persistent
 
 # Run performance benchmark
 cargo run --release --features cuda --example bench_cuda

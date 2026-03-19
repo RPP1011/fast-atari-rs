@@ -47,7 +47,7 @@ void run_one_cycle(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
 // Run one frame
 // ============================================================
 __device__
-uint64_t run_frame(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
+void run_frame(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
     c->tia_frame_complete = 0;
     uint64_t cycles = 0;
 
@@ -58,11 +58,10 @@ uint64_t run_frame(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl) {
         run_one_cycle(c, mr, &cycles, rp, rl);
         if (cycles > 100000) break;
     }
-    return cycles;
 }
 
 // ============================================================
-// Main kernel: shared memory for RAM, registers for CPU state
+// Per-frame kernel (Phase 2 compatibility — still used for tests)
 // ============================================================
 extern "C"
 __global__
@@ -74,35 +73,74 @@ void atari_frame_kernel(
     uint32_t rom_len,
     int N
 ) {
-    // Shared memory for PIA RAM: [thread][byte]
     __shared__ uint8_t sram[BLOCK_SIZE][128];
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // Pointer to this thread's 128-byte RAM in shared memory
     uint8_t* my_ram = sram[threadIdx.x];
 
-    // Load state from global → registers
     ThreadCtx ctx;
     load_ctx(&ctx, &states[idx]);
 
-    // Load RAM from global → shared
     const uint8_t* gram = states[idx].ram;
-    for (int i = 0; i < 128; i++) {
-        my_ram[i] = gram[i];
-    }
+    for (int i = 0; i < 128; i++) my_ram[i] = gram[i];
 
-    // Apply action
     apply_action(&ctx, actions[idx]);
-
-    // Run one frame (all in registers + shared memory)
     run_frame(&ctx, my_ram, rom_ptr, rom_len);
 
-    // Store registers → global
+    store_ctx(&states[idx], &ctx);
+    uint8_t* gram_out = states[idx].ram;
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        gram_out[i] = v;
+        obs[i] = v;
+    }
+}
+
+// ============================================================
+// Multi-frame kernel (Phase 3)
+//
+// Runs K frames in a single kernel launch. State stays in registers
+// and shared memory across all K frames — no load/store between frames.
+// Actions: actions[frame * N + idx] for each frame.
+// Obs: only the LAST frame's obs is written to obs_out[idx * 128].
+// ============================================================
+extern "C"
+__global__
+void atari_multi_frame_kernel(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,  // K * N actions
+    uint8_t* __restrict__ obs_out,        // N * 128 obs (last frame only)
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    int K,  // number of frames
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    uint8_t* my_ram = sram[threadIdx.x];
+
+    // One-time load from global → registers + shared
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+    const uint8_t* gram = states[idx].ram;
+    for (int i = 0; i < 128; i++) my_ram[i] = gram[i];
+
+    // Run K frames
+    for (int f = 0; f < K; f++) {
+        apply_action(&ctx, actions[f * N + idx]);
+        run_frame(&ctx, my_ram, rom_ptr, rom_len);
+    }
+
+    // Store state back to global
     store_ctx(&states[idx], &ctx);
 
-    // Store RAM: shared → global + observation buffer
+    // Store RAM → global + obs
     uint8_t* gram_out = states[idx].ram;
     uint8_t* obs = &obs_out[idx * 128];
     for (int i = 0; i < 128; i++) {
