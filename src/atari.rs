@@ -537,8 +537,10 @@ impl HeadlessAtari {
     #[inline]
     fn run_one_cycle(&mut self, cycles: &mut u64) {
         if self.bus.tia.wsync {
-            self.tick_components();
-            *cycles += 1;
+            // Fast-forward to end of scanline instead of ticking one cycle at a time
+            let skipped = self.bus.tia.skip_to_scanline_end();
+            self.bus.pia.tick_n(skipped);
+            *cycles += skipped as u64;
         } else {
             let c = self.cpu.step(&mut self.bus) as u64;
             *cycles += c;

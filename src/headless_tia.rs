@@ -143,19 +143,46 @@ impl HeadlessTia {
     pub fn tick3(&mut self) {
         self.clock += 3;
         if self.clock >= 228 {
-            self.clock -= 228;
-            self.scanline += 1;
-            self.wsync = false;
+            self.end_scanline();
+        }
+    }
 
-            if !self.paddle_dumped && self.paddle_counter < 256 {
-                self.paddle_counter += 1;
-            }
+    /// How many CPU cycles remain until end of current scanline.
+    /// Returns 0 if we're exactly at a scanline boundary.
+    #[inline]
+    pub fn cycles_until_scanline_end(&self) -> u16 {
+        // 228 TIA clocks per scanline, 3 TIA clocks per CPU cycle = 76 CPU cycles
+        // Current position in CPU cycles: clock / 3 (rounded up)
+        let tia_remaining = 228u16.saturating_sub(self.clock);
+        (tia_remaining + 2) / 3 // ceiling division
+    }
 
-            if self.scanline >= SCANLINES_PER_FRAME {
-                self.scanline = 0;
-                if !self.frame_complete {
-                    self.frame_complete = true;
-                }
+    /// Fast-forward to end of current scanline. Used for WSYNC.
+    /// Returns the number of CPU cycles skipped.
+    #[inline]
+    pub fn skip_to_scanline_end(&mut self) -> u16 {
+        let cpu_cycles = self.cycles_until_scanline_end();
+        if cpu_cycles > 0 {
+            self.clock = 0;
+            self.end_scanline();
+        }
+        cpu_cycles
+    }
+
+    #[inline]
+    fn end_scanline(&mut self) {
+        self.clock -= 228;
+        self.scanline += 1;
+        self.wsync = false;
+
+        if !self.paddle_dumped && self.paddle_counter < 256 {
+            self.paddle_counter += 1;
+        }
+
+        if self.scanline >= SCANLINES_PER_FRAME {
+            self.scanline = 0;
+            if !self.frame_complete {
+                self.frame_complete = true;
             }
         }
     }

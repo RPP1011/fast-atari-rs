@@ -5,6 +5,10 @@ edition = "2024"
 description = "An optimized Atari 2600 emulator with Gymnasium-compatible environment API"
 
 [dependencies]
+coz = "0.1"
 
 [dev-dependencies]
 png = "0.17"
+
+[profile.release]
+debug = 1
