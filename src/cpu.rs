@@ -14,7 +14,7 @@ pub struct StatusFlags {
 }
 
 impl StatusFlags {
-    pub fn to_Byte(self) -> u8 {
+    pub fn to_byte(self) -> u8 {
         (self.carry as u8)
             | ((self.zero as u8) << 1)
             | ((self.interrupt_disable as u8) << 2)
@@ -926,7 +926,7 @@ impl Cpu {
             // PHP — Push Processor status
             OpCode::PhpImplied => {
                 // PHP always pushes with break and unused bits set
-                let flags = self.status.to_Byte() | 0x30;
+                let flags = self.status.to_byte() | 0x30;
                 memory.write(0x0100 | self.sp as u16, flags);
                 self.sp = self.sp.wrapping_sub(1);
             }
@@ -986,7 +986,7 @@ impl Cpu {
                 self.sp = self.sp.wrapping_sub(1);
                 memory.write(0x0100 | self.sp as u16, ret as u8);
                 self.sp = self.sp.wrapping_sub(1);
-                let flags = self.status.to_Byte() | 0x30; // set break + unused
+                let flags = self.status.to_byte() | 0x30; // set break + unused
                 memory.write(0x0100 | self.sp as u16, flags);
                 self.sp = self.sp.wrapping_sub(1);
                 self.status.interrupt_disable = true;
