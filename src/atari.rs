@@ -289,29 +289,43 @@ impl Atari {
         cycles
     }
 
-    /// Flush pending TIA/PIA ticks, then execute one CPU instruction.
-    /// The key insight: by ticking TIA for the *previous* instruction's
-    /// cycles before executing the *next* instruction, register writes
-    /// from the CPU land when the TIA beam is at the correct position.
+    /// Execute one CPU step with interleaved TIA/PIA ticking.
+    ///
+    /// On real hardware the TIA beam advances continuously during CPU
+    /// execution, and register writes take effect on the last cycle.
+    /// We approximate this by ticking TIA for (N-1) cycles before the
+    /// write, then 1 cycle after — so the write lands near the end of
+    /// the instruction, matching real hardware behavior.
     #[inline]
     fn run_one_cycle(&mut self, cycles: &mut u64) {
-        // Flush pending ticks from the previous instruction
-        for _ in 0..self.pending_cycles {
-            self.tick_components();
-        }
-        self.pending_cycles = 0;
-
         if self.bus.tia.wsync {
-            // CPU halted — tick one CPU cycle at a time until WSYNC clears
             self.tick_components();
             *cycles += 1;
         } else {
-            // Execute CPU instruction — writes to TIA happen here
-            let c = self.cpu.step(&mut self.bus) as u64;
-            *cycles += c;
-            // Don't tick yet — defer until next call so the beam advances
-            // to the correct position before the next instruction's writes
-            self.pending_cycles = c;
+            // Peek at opcode to get cycle count before executing
+            let op = crate::cpu::OpCode::decode(&mut self.bus, self.cpu.pc);
+            let c = match &op {
+                Some(op) => {
+                    let d = op.details();
+                    d.cycle_count as u64
+                }
+                None => 2, // fallback
+            };
+
+            // Tick TIA for (c-1) cycles — beam advances to just before the write
+            for _ in 0..c.saturating_sub(1) {
+                self.tick_components();
+            }
+
+            // Execute the instruction — register writes happen here
+            let actual_c = self.cpu.step(&mut self.bus) as u64;
+            *cycles += actual_c;
+
+            // Tick the remaining cycle(s) after the write
+            let remaining = actual_c.saturating_sub(c.saturating_sub(1));
+            for _ in 0..remaining {
+                self.tick_components();
+            }
         }
     }
 
@@ -329,6 +343,7 @@ impl Env for Atari {
         self.cpu = Cpu::new();
         self.bus.tia = Tia::new();
         self.bus.pia = Pia::new();
+        self.pending_cycles = 0;
         self.cpu.reset(&mut self.bus);
 
         // Run one frame to get initial observation
