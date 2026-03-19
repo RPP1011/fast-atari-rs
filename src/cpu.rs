@@ -996,6 +996,15 @@ impl Cpu {
                 return details.cycle_count;
             }
 
+            // Flag Instructions
+            OpCode::ClcImplied => { self.status.carry = false; }
+            OpCode::SecImplied => { self.status.carry = true; }
+            OpCode::CliImplied => { self.status.interrupt_disable = false; }
+            OpCode::SeiImplied => { self.status.interrupt_disable = true; }
+            OpCode::ClvImplied => { self.status.overflow = false; }
+            OpCode::CldImplied => { self.status.decimal = false; }
+            OpCode::SedImplied => { self.status.decimal = true; }
+
             // NOP
             OpCode::NopImplied => {}
 
