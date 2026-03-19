@@ -10,7 +10,7 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 
 ## Benchmarks
 
-### stella-rs vs ALE (Gymnasium)
+### fast-atari-rs vs ALE (Gymnasium)
 
 ![Benchmark scaling](benchmark_scaling.png)
 
@@ -18,22 +18,22 @@ Turns out it is really easy to fix. There is a difference between pragmatism and
 
 | Emulator | FPS |
 |---|---|
-| stella-rs (headless, WSYNC fast-forward) | **12,283** |
-| stella-rs (headless) | 10,118 |
+| fast-atari-rs (headless, WSYNC fast-forward) | **12,283** |
+| fast-atari-rs (headless) | 10,118 |
 | ALE-raw (headless, no obs) | 16,240 |
 | ALE-raw (screen obs) | 13,164 |
 | ALE (gymnasium) | 12,429 |
-| stella-rs (rendering) | 2,268 |
+| fast-atari-rs (rendering) | 2,268 |
 
 #### Aggregate throughput at 32 cores
 
 | Emulator | FPS | Efficiency |
 |---|---|---|
 | ALE-raw (headless) | 248,310 | 47.8% |
-| **stella-rs (headless)** | **210,129** | **53.5%** |
+| **fast-atari-rs (headless)** | **210,129** | **53.5%** |
 | ALE (gymnasium) | 186,683 | 46.9% |
 
-stella-rs headless is within 1.3x of ALE's raw C++ core per-thread, with better parallel scaling. The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
+fast-atari-rs headless is within 1.3x of ALE's raw C++ core per-thread, with better parallel scaling. The architecture is intentionally simple (no jump tables, no computed goto) to facilitate a future CUDA port.
 
 ### Profiling (headless mode)
 
@@ -49,7 +49,7 @@ stella-rs headless is within 1.3x of ALE's raw C++ core per-thread, with better 
 ### Running benchmarks
 
 ```bash
-# stella-rs scaling benchmark (rendering + headless)
+# fast-atari-rs scaling benchmark (rendering + headless)
 cargo run --release --example benchmark -- <ROM> [MAX_THREADS] [SECONDS]
 
 # ALE comparison (requires gymnasium + ale-py in .venv)

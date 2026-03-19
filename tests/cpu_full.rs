@@ -9,7 +9,7 @@
 //!
 //! Run with:  cargo test -- cpu_full
 
-use stella_rs::cpu::{Cpu, FlatMemory};
+use fast_atari_rs::cpu::{Cpu, FlatMemory};
 
 const DORMANN_BIN_URL: &str =
     "https://raw.githubusercontent.com/Klaus2m5/6502_65C02_functional_tests/master/bin_files/6502_functional_test.bin";

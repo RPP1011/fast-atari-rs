@@ -1,7 +1,7 @@
 /// Shared test utilities for frame capture and image export.
 
-use stella_rs::atari::Atari;
-use stella_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT, DISPLAY_WIDTH};
+use fast_atari_rs::atari::Atari;
+use fast_atari_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT, DISPLAY_WIDTH};
 
 /// NTSC color palette — maps TIA palette index to (R, G, B).
 pub fn ntsc_color(idx: u8) -> (u8, u8, u8) {

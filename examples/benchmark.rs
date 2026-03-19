@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use stella_rs::atari::{Action, Atari, HeadlessAtari};
+use fast_atari_rs::atari::{Action, Atari, HeadlessAtari};
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -148,7 +148,7 @@ fn main() {
         thread_counts.push(max_threads);
     }
 
-    println!("stella-rs scaling benchmark");
+    println!("fast-atari-rs scaling benchmark");
     println!("  ROM:             {}", args[1]);
     println!("  Max threads:     {}", max_threads);
     println!("  Duration/run:    {}s", duration_secs);
@@ -175,8 +175,8 @@ fn main() {
     }
 
     // Write results
-    write_json(&rendering_results, "stella-rs", "benchmark_stella_rs.json");
-    write_json(&headless_results, "stella-rs (headless)", "benchmark_stella_rs_headless.json");
+    write_json(&rendering_results, "fast-atari-rs", "benchmark_fast_atari_rs.json");
+    write_json(&headless_results, "fast-atari-rs (headless)", "benchmark_fast_atari_rs_headless.json");
 
     println!("\n  --- Rendering ---");
     print_table(&rendering_results);

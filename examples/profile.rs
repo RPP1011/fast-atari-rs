@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use stella_rs::atari::{Action, Atari, HeadlessAtari};
+use fast_atari_rs::atari::{Action, Atari, HeadlessAtari};
 
 fn main() {
     coz::thread_init();

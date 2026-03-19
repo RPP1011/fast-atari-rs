@@ -1,5 +1,5 @@
 [package]
-name = "stella-rs"
+name = "fast-atari-rs"
 version = "0.1.0"
 edition = "2024"
 description = "An optimized Atari 2600 emulator with Gymnasium-compatible environment API"
