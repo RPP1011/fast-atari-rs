@@ -1,10 +1,11 @@
 /// rl4burn-compatible Atari 2600 environments.
 ///
-/// Provides two environment variants:
+/// Provides three environment variants:
 /// - [`AtariEnv`]: Full rendering with framebuffer observations (160×192 grayscale).
-/// - [`HeadlessAtariEnv`]: RAM-only observations (128 bytes) for maximum throughput.
+/// - [`HeadlessAtariEnv`]: RAM-only observations (128 bytes) for maximum CPU throughput.
+/// - [`BatchAtariGpuEnv`]: CUDA-accelerated batched environments (requires `cuda` feature).
 ///
-/// Both implement [`rl4burn_core::env::Env`] with `Observation = Vec<f32>` and
+/// All implement [`rl4burn_core::env::Env`] with `Observation = Vec<f32>` and
 /// `Action = usize` (discrete, 18 ALE actions).
 
 use rl4burn_core::env::render::{Renderable, RgbFrame};
@@ -13,6 +14,9 @@ use rl4burn_core::env::{Env, Step};
 
 use crate::atari::{Action, Atari, HeadlessAtari};
 use crate::tia::{FRAME_HEIGHT, FRAME_WIDTH};
+
+#[cfg(feature = "cuda")]
+use crate::cuda_env::BatchAtariGpu;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -194,7 +198,7 @@ impl HeadlessAtariEnv {
     }
 
     /// Access the raw 128-byte PIA RAM.
-    pub fn ram(&self) -> &[u8; 128] {
+    pub fn ram(&self) -> &[u8] {
         self.console.ram()
     }
 
@@ -238,6 +242,135 @@ impl Env for HeadlessAtariEnv {
         Space::Box {
             low: vec![0.0; 128],
             high: vec![1.0; 128],
+        }
+    }
+
+    fn action_space(&self) -> Space {
+        Space::Discrete(NUM_ACTIONS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BatchAtariGpuEnv — CUDA-accelerated batched environments
+// ---------------------------------------------------------------------------
+
+/// CUDA-accelerated batched Atari 2600 environments.
+///
+/// Runs N emulator instances in parallel on the GPU. Each `step()` call
+/// launches a CUDA kernel that advances all N instances by one frame.
+///
+/// Observations are the 128-byte PIA RAM from each instance, concatenated
+/// and normalised to `[0.0, 1.0]`. The batch dimension is flattened into
+/// the observation vector: `obs.len() == N * 128`.
+///
+/// Supports multi-frame stepping and optional warp-level opcode sorting
+/// (Phase 4) for reduced divergence on certain ROMs.
+#[cfg(feature = "cuda")]
+pub struct BatchAtariGpuEnv {
+    gpu: BatchAtariGpu,
+    rom: Vec<u8>,
+    step_count: usize,
+    max_steps: usize,
+    frameskip: usize,
+    last_actions: Vec<u8>,
+}
+
+#[cfg(feature = "cuda")]
+impl BatchAtariGpuEnv {
+    /// Create a new batched GPU environment.
+    ///
+    /// `n` is the number of parallel emulator instances.
+    /// Panics if CUDA initialisation fails.
+    pub fn new(rom: Vec<u8>, n: usize) -> Self {
+        let gpu = BatchAtariGpu::new(rom.clone(), n)
+            .expect("failed to initialise CUDA BatchAtariGpu");
+        Self {
+            gpu,
+            rom,
+            step_count: 0,
+            max_steps: DEFAULT_MAX_STEPS,
+            frameskip: DEFAULT_FRAMESKIP,
+            last_actions: vec![0; n],
+        }
+    }
+
+    /// Set maximum steps per episode (0 = unlimited).
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    /// Set number of frames to skip per step (action repeat).
+    pub fn with_frameskip(mut self, frameskip: usize) -> Self {
+        self.frameskip = frameskip;
+        self
+    }
+
+    /// Enable Phase 4 warp-level opcode sorting for reduced divergence.
+    pub fn with_sorted(mut self, sorted: bool) -> Self {
+        self.gpu.set_sorted(sorted);
+        self
+    }
+
+    /// Number of parallel environments.
+    pub fn num_envs(&self) -> usize {
+        self.gpu.num_envs()
+    }
+
+    fn obs_from_raw(&self, raw: &[u8]) -> Vec<f32> {
+        raw.iter().map(|&b| b as f32 / 255.0).collect()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Env for BatchAtariGpuEnv {
+    type Observation = Vec<f32>;
+    type Action = usize;
+
+    fn reset(&mut self) -> Vec<f32> {
+        self.step_count = 0;
+        self.last_actions = vec![0; self.gpu.num_envs()];
+        let obs = self.gpu.reset().expect("CUDA reset failed");
+        // Flatten all instance observations into one vector
+        obs.iter()
+            .flat_map(|ram| ram.iter().map(|&b| b as f32 / 255.0))
+            .collect()
+    }
+
+    fn step(&mut self, action: usize) -> Step<Vec<f32>> {
+        // Broadcast single action to all instances
+        let n = self.gpu.num_envs();
+        let actions = vec![action as u8; n];
+
+        let raw = if self.frameskip > 1 {
+            // Use multi-frame kernel for efficiency
+            let multi_actions: Vec<u8> = actions.iter()
+                .cycle()
+                .take(n * self.frameskip)
+                .copied()
+                .collect();
+            self.gpu.step_multi(&multi_actions, self.frameskip)
+                .expect("CUDA step_multi failed")
+        } else {
+            self.gpu.step(&actions).expect("CUDA step failed")
+        };
+
+        self.step_count += 1;
+        let truncated = self.max_steps > 0 && self.step_count >= self.max_steps;
+
+        Step {
+            observation: self.obs_from_raw(&raw),
+            reward: 0.0,
+            terminated: false,
+            truncated,
+        }
+    }
+
+    fn observation_space(&self) -> Space {
+        let size = self.gpu.num_envs() * 128;
+        Space::Box {
+            low: vec![0.0; size],
+            high: vec![1.0; size],
         }
     }
 

@@ -1,6 +1,6 @@
-"""Plot scaling benchmark results: stella-rs vs ALE (gymnasium + raw).
+"""Plot scaling benchmark results: fast-atari-rs vs ALE (gymnasium + raw).
 
-Reads benchmark_stella_rs.json, benchmark_ale.json, benchmark_ale_raw.json.
+Reads benchmark_fast_atari_rs.json, benchmark_ale.json, benchmark_ale_raw.json.
 """
 
 import json
@@ -25,8 +25,8 @@ def series(data):
 
 
 COLORS = {
-    "stella-rs":              "#e74c3c",
-    "stella-rs (headless)":   "#c0392b",
+    "fast-atari-rs":              "#e74c3c",
+    "fast-atari-rs (headless)":   "#c0392b",
     "ALE (gymnasium)":        "#95a5a6",
     "ALE-raw (headless)":     "#2c3e50",
     "ALE-raw (ram)":          "#2980b9",
@@ -34,8 +34,8 @@ COLORS = {
 }
 
 MARKERS = {
-    "stella-rs":              "o",
-    "stella-rs (headless)":   "P",
+    "fast-atari-rs":              "o",
+    "fast-atari-rs (headless)":   "P",
     "ALE (gymnasium)":        "d",
     "ALE-raw (headless)":     "^",
     "ALE-raw (ram)":          "s",
@@ -46,14 +46,14 @@ MARKERS = {
 def main():
     out_file = sys.argv[1] if len(sys.argv) > 1 else "benchmark_scaling.png"
 
-    stella = load_json("benchmark_stella_rs.json")
-    stella_headless = load_json("benchmark_stella_rs_headless.json")
+    stella = load_json("benchmark_fast_atari_rs.json")
+    stella_headless = load_json("benchmark_fast_atari_rs_headless.json")
     ale_gym = load_json("benchmark_ale.json")
     ale_raw = load_json("benchmark_ale_raw.json")
 
     datasets = [
-        ("stella-rs", stella),
-        ("stella-rs (headless)", stella_headless),
+        ("fast-atari-rs", stella),
+        ("fast-atari-rs (headless)", stella_headless),
         ("ALE (gymnasium)", ale_gym),
         ("ALE-raw (headless)", ale_raw["headless"]),
         ("ALE-raw (ram)", ale_raw["ram"]),
@@ -62,7 +62,7 @@ def main():
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     fig.suptitle(
-        "Atari Emulator Throughput: stella-rs vs ALE",
+        "Atari Emulator Throughput: fast-atari-rs vs ALE",
         fontsize=14, fontweight="bold",
     )
 
@@ -70,7 +70,7 @@ def main():
         threads, fps, fpt = series(data)
         color = COLORS[name]
         marker = MARKERS[name]
-        lw = 2.5 if name == "stella-rs" else 1.8
+        lw = 2.5 if name == "fast-atari-rs" else 1.8
 
         # Plot 1: Aggregate FPS
         axes[0].plot(threads, fps, f"{marker}-", color=color, linewidth=lw,
@@ -86,7 +86,7 @@ def main():
                      markersize=7, label=name, zorder=3)
 
     # Add ideal scaling lines for key series
-    for name, data in [("stella-rs (headless)", stella_headless),
+    for name, data in [("fast-atari-rs (headless)", stella_headless),
                         ("ALE-raw (headless)", ale_raw["headless"])]:
         threads, fps, _ = series(data)
         axes[0].plot(threads, [fps[0] * t for t in threads],

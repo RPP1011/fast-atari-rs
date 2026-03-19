@@ -1,7 +1,7 @@
 mod common;
 
-use stella_rs::atari::{Atari, Action};
-use stella_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT};
+use fast_atari_rs::atari::{Atari, Action};
+use fast_atari_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT};
 
 #[test]
 fn breakout_runs_and_renders() {

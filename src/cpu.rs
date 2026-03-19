@@ -116,6 +116,27 @@ macro_rules! opcodes {
                     }, )*
                 }
             }
+
+            /// Static lookup table: opcode byte → base cycle count.
+            pub const CYCLE_TABLE: [u8; 256] = {
+                let mut table = [0u8; 256];
+                $( table[$hex as usize] = $cc; )*
+                table
+            };
+
+            /// Static lookup table: opcode byte → instruction size in bytes.
+            pub const SIZE_TABLE: [u16; 256] = {
+                let mut table = [1u16; 256];
+                $( table[$hex as usize] = opcodes!(@size $($operand)?); )*
+                table
+            };
+
+            /// Static lookup table: opcode byte → has extra cycle on page boundary cross.
+            pub const PAGE_CROSS_TABLE: [bool; 256] = {
+                let mut table = [false; 256];
+                $( table[$hex as usize] = $ec; )*
+                table
+            };
         }
     };
 }
@@ -653,9 +674,10 @@ impl Cpu {
 
     /// Execute a single instruction. Returns the number of cycles consumed.
     pub fn step<M: Memory>(&mut self, memory: &mut M) -> u8 {
+        let opcode_byte = memory.read(self.pc);
         let op = OpCode::decode(memory, self.pc)
-            .unwrap_or_else(|| panic!("illegal opcode: 0x{:02X} at PC=0x{:04X}", memory.read(self.pc), self.pc));
-        let details = op.details();
+            .unwrap_or_else(|| panic!("illegal opcode: 0x{:02X} at PC=0x{:04X}", opcode_byte, self.pc));
+        let base_cycles = OpCode::CYCLE_TABLE[opcode_byte as usize];
 
         match op {
             // ADC — Add with Carry
@@ -986,7 +1008,7 @@ impl Cpu {
                 let addr = self.resolve_addr(&op, memory).unwrap();
                 // JMP sets PC directly — skip the normal pc += size advance
                 self.pc = addr;
-                return details.cycle_count;
+                return base_cycles;
             }
 
             // JSR — Jump to Subroutine (push return addr - 1, then jump)
@@ -997,7 +1019,7 @@ impl Cpu {
                 memory.write(0x0100 | self.sp as u16, ret as u8);
                 self.sp = self.sp.wrapping_sub(1);
                 self.pc = addr;
-                return details.cycle_count;
+                return base_cycles;
             }
 
             // RTS — Return from Subroutine
@@ -1007,7 +1029,7 @@ impl Cpu {
                 self.sp = self.sp.wrapping_add(1);
                 let hi = memory.read(0x0100 | self.sp as u16) as u16;
                 self.pc = ((hi << 8) | lo).wrapping_add(1);
-                return details.cycle_count;
+                return base_cycles;
             }
 
             // RTI — Return from Interrupt
@@ -1020,7 +1042,7 @@ impl Cpu {
                 self.sp = self.sp.wrapping_add(1);
                 let hi = memory.read(0x0100 | self.sp as u16) as u16;
                 self.pc = (hi << 8) | lo;
-                return details.cycle_count;
+                return base_cycles;
             }
 
             // BRK — Force Interrupt
@@ -1037,7 +1059,7 @@ impl Cpu {
                 let lo = memory.read(0xFFFE) as u16;
                 let hi = memory.read(0xFFFF) as u16;
                 self.pc = (hi << 8) | lo;
-                return details.cycle_count;
+                return base_cycles;
             }
 
             // Flag Instructions
@@ -1067,11 +1089,11 @@ impl Cpu {
                     _ => unreachable!(),
                 };
                 if taken {
-                    let next_pc = self.pc.wrapping_add(op.size());
+                    let next_pc = self.pc.wrapping_add(OpCode::SIZE_TABLE[opcode_byte as usize]);
                     let target = next_pc.wrapping_add(off as i8 as u16);
                     let page_cross = (next_pc & 0xFF00) != (target & 0xFF00);
                     self.pc = target;
-                    return details.cycle_count + 1 + page_cross as u8;
+                    return base_cycles + 1 + page_cross as u8;
                 }
             }
 
@@ -1079,14 +1101,14 @@ impl Cpu {
             OpCode::NopImplied => {}
         }
 
-        let penalty = if details.extra_cycle_on_page_bound_cross {
+        let penalty = if OpCode::PAGE_CROSS_TABLE[opcode_byte as usize] {
             self.page_cross_penalty(&op, memory)
         } else {
             0
         };
 
-        self.pc += op.size();
-        details.cycle_count + penalty
+        self.pc += OpCode::SIZE_TABLE[opcode_byte as usize];
+        base_cycles + penalty
     }
 }
 

@@ -1,15 +1,21 @@
 [package]
-name = "stella-rs"
+name = "fast-atari-rs"
 version = "0.1.0"
 edition = "2024"
 description = "An optimized Atari 2600 emulator with Gymnasium-compatible environment API"
 
+[features]
+default = []
+cuda = ["cudarc"]
+rl4burn = ["rl4burn-core"]
+
 [dependencies]
+coz = "0.1"
+cudarc = { version = "0.12", optional = true, features = ["cuda-12000"] }
 rl4burn-core = { git = "https://github.com/RPP1011/rl4burn", optional = true }
 
 [dev-dependencies]
 png = "0.17"
 
-[features]
-default = []
-rl4burn = ["rl4burn-core"]
+[profile.release]
+debug = 1
