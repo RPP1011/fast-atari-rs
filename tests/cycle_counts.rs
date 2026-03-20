@@ -1,4 +1,4 @@
-use stella_rs::cpu::{Cpu, FlatMemory};
+use fast_atari_rs::cpu::{Cpu, FlatMemory};
 
 /// Helper: load code at $8000, set reset vector, run one instruction, return cycles.
 fn run_one(code: &[u8]) -> (Cpu, u8) {

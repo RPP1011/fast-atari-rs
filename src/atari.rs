@@ -381,10 +381,26 @@ impl Env for Atari {
 // Headless Atari — no framebuffer, no pixel rendering, maximum throughput.
 // ---------------------------------------------------------------------------
 
-/// Memory bus using HeadlessTia instead of the rendering Tia.
+/// Flat memory bus for headless mode.
+///
+/// The 2600 has a 13-bit address space (8KB). We flatten the entire thing
+/// into a single `[u8; 8192]` array:
+///   - `$0080–$00FF` → PIA RAM (128 bytes), mirrored at `$0180–$01FF` (stack)
+///   - `$1000–$1FFF` → ROM (current 4K bank, copied in at load / bank switch)
+///   - Everything else in the array is unused padding
+///
+/// Reads hit the flat array first. Only addresses that need special handling
+/// (TIA registers, PIA I/O) fall through to the slow path. Since ~90% of
+/// reads are instruction/operand fetches from ROM, this eliminates address
+/// decoding, bankswitch checks, and bounds checks from the hot path.
+///
+/// Writes always go through dispatch (ROM is never written).
 pub struct HeadlessBus {
     pub tia: HeadlessTia,
     pub pia: Pia,
+    /// Flat 8KB address space. ROM and PIA RAM live at their real addresses.
+    pub mem: Box<[u8; 8192]>,
+    /// Full ROM image (for bankswitched games, all banks concatenated).
     pub rom: Vec<u8>,
     pub bank: usize,
     pub scheme: BankScheme,
@@ -399,73 +415,140 @@ impl HeadlessBus {
             BankScheme::F6 => 3,
             BankScheme::F4 => 7,
         };
-        Self { tia: HeadlessTia::new(), pia: Pia::new(), rom, bank, scheme }
+
+        let mut bus = Self {
+            tia: HeadlessTia::new(),
+            pia: Pia::new(),
+            mem: Box::new([0u8; 8192]),
+            rom,
+            bank,
+            scheme,
+        };
+        bus.load_bank(bank);
+        bus.sync_ram_to_mem();
+        bus
     }
 
-    fn rom_read(&self, addr: u16) -> u8 {
-        match self.scheme {
+    /// Copy a ROM bank into the flat address space at $1000–$1FFF.
+    fn load_bank(&mut self, bank: usize) {
+        let src = match self.scheme {
             BankScheme::Fixed => {
-                let index = (addr & 0x0FFF) as usize % self.rom.len();
-                self.rom[index]
+                // 2K/4K ROM: mirror into the 4K window
+                let rom_len = self.rom.len();
+                for i in 0..4096 {
+                    self.mem[0x1000 + i] = self.rom[i % rom_len];
+                }
+                return;
             }
             _ => {
-                let offset = self.bank * 4096 + (addr & 0x0FFF) as usize;
-                *self.rom.get(offset).unwrap_or(&0)
+                let offset = bank * 4096;
+                &self.rom[offset..offset + 4096]
             }
-        }
+        };
+        self.mem[0x1000..0x2000].copy_from_slice(src);
     }
 
+    /// Sync PIA RAM into the flat array (call before reads that might hit RAM).
+    /// PIA RAM at $0080–$00FF, mirrored at $0180–$01FF (stack page).
+    #[inline]
+    fn sync_ram_to_mem(&mut self) {
+        self.mem[0x80..0x100].copy_from_slice(&self.pia.ram);
+        self.mem[0x180..0x200].copy_from_slice(&self.pia.ram);
+    }
+
+    #[inline]
     fn check_bankswitch(&mut self, addr: u16) {
         let a = addr & 0x1FFF;
-        match self.scheme {
-            BankScheme::Fixed => {}
+        let new_bank = match self.scheme {
+            BankScheme::Fixed => return,
             BankScheme::F8 => match a {
-                0x1FF8 => self.bank = 0,
-                0x1FF9 => self.bank = 1,
-                _ => {}
+                0x1FF8 => 0,
+                0x1FF9 => 1,
+                _ => return,
             },
             BankScheme::F6 => match a {
-                0x1FF6 => self.bank = 0,
-                0x1FF7 => self.bank = 1,
-                0x1FF8 => self.bank = 2,
-                0x1FF9 => self.bank = 3,
-                _ => {}
+                0x1FF6 => 0,
+                0x1FF7 => 1,
+                0x1FF8 => 2,
+                0x1FF9 => 3,
+                _ => return,
             },
             BankScheme::F4 => match a {
-                0x1FF4 => self.bank = 0,
-                0x1FF5 => self.bank = 1,
-                0x1FF6 => self.bank = 2,
-                0x1FF7 => self.bank = 3,
-                0x1FF8 => self.bank = 4,
-                0x1FF9 => self.bank = 5,
-                0x1FFA => self.bank = 6,
-                0x1FFB => self.bank = 7,
-                _ => {}
+                0x1FF4 => 0,
+                0x1FF5 => 1,
+                0x1FF6 => 2,
+                0x1FF7 => 3,
+                0x1FF8 => 4,
+                0x1FF9 => 5,
+                0x1FFA => 6,
+                0x1FFB => 7,
+                _ => return,
             },
+        };
+        if new_bank != self.bank {
+            self.bank = new_bank;
+            self.load_bank(new_bank);
         }
     }
 }
 
 impl Memory for HeadlessBus {
+    #[inline]
     fn read(&mut self, addr: u16) -> u8 {
-        self.check_bankswitch(addr);
-        match addr & 0x1FFF {
-            a if a & 0x1080 == 0x0000 => self.tia.read(a),
-            a if a & 0x1280 == 0x0080 => self.pia.read(a),
-            a if a & 0x1280 == 0x0280 => self.pia.read(a),
-            a if a & 0x1000 == 0x1000 => self.rom_read(a),
-            _ => 0,
+        let a = addr & 0x1FFF;
+
+        // Fast path: bit 12 or (bit 7 set AND bit 9 clear) → ROM or RAM
+        // ROM: $1000–$1FFF, RAM: $80–$FF / $180–$1FF (stack)
+        // Excludes PIA I/O ($0280–$029F) which also has bit 7 set
+        if a & 0x1080 != 0 && (a & 0x1280) != 0x0280 {
+            if a & 0x1000 != 0 && self.scheme != BankScheme::Fixed {
+                self.check_bankswitch(addr);
+            }
+            return self.mem[a as usize];
         }
+
+        // PIA I/O: $280–$29F (A12=0, A9=1)
+        if a & 0x1280 == 0x0280 {
+            return self.pia.read(a);
+        }
+
+        // TIA read registers or fallback
+        if a & 0x1080 == 0x0000 {
+            return self.tia.read(a);
+        }
+        0
     }
 
+    #[inline]
     fn write(&mut self, addr: u16, val: u8) {
-        self.check_bankswitch(addr);
-        match addr & 0x1FFF {
-            a if a & 0x1080 == 0x0000 => self.tia.write(a, val),
-            a if a & 0x1280 == 0x0080 => self.pia.write(a, val),
-            a if a & 0x1280 == 0x0280 => self.pia.write(a, val),
-            _ => {}
+        let a = addr & 0x1FFF;
+
+        // ROM space — only bankswitch hotspots matter
+        if a & 0x1000 != 0 {
+            if self.scheme != BankScheme::Fixed {
+                self.check_bankswitch(addr);
+            }
+            return;
         }
+
+        // PIA RAM: $80–$FF or $180–$1FF
+        if a & 0x80 != 0 && a & 0x200 == 0 {
+            // Write to both PIA and flat array (keep in sync)
+            self.pia.ram[(a & 0x7F) as usize] = val;
+            self.mem[(a | 0x80) as usize & 0x1FF] = val;
+            // Mirror
+            self.mem[((a | 0x80) as usize & 0x1FF) ^ 0x100] = val;
+            return;
+        }
+
+        // PIA I/O: $280–$29F
+        if a & 0x200 != 0 {
+            self.pia.write(a, val);
+            return;
+        }
+
+        // TIA write registers
+        self.tia.write(a, val);
     }
 }
 
@@ -498,14 +581,6 @@ impl HeadlessAtari {
         self.bus.tia.set_paddle(0, paddle);
     }
 
-    /// Advance one CPU cycle worth of TIA + PIA clocks.
-    /// Uses tick3 (single call per CPU cycle) instead of 3× tick.
-    #[inline]
-    fn tick_components(&mut self) {
-        self.bus.tia.tick3();
-        self.bus.pia.tick();
-    }
-
     pub fn run_frame(&mut self) -> u64 {
         self.bus.tia.frame_complete = false;
         let mut cycles: u64 = 0;
@@ -525,20 +600,22 @@ impl HeadlessAtari {
     #[inline]
     fn run_one_cycle(&mut self, cycles: &mut u64) {
         if self.bus.tia.wsync {
-            self.tick_components();
-            *cycles += 1;
+            // Fast-forward to end of scanline instead of ticking one cycle at a time
+            let skipped = self.bus.tia.skip_to_scanline_end();
+            self.bus.pia.tick_n(skipped);
+            *cycles += skipped as u64;
         } else {
-            let c = self.cpu.step(&mut self.bus) as u64;
-            *cycles += c;
-            for _ in 0..c {
-                self.tick_components();
-            }
+            let c = self.cpu.step(&mut self.bus);
+            *cycles += c as u64;
+            // Batch-advance TIA and PIA instead of per-cycle loop
+            self.bus.tia.tick_n(c);
+            self.bus.pia.tick_n(c as u16);
         }
     }
 
-    /// Access PIA RAM for observation (128 bytes, no rendering needed).
-    pub fn ram(&self) -> &[u8; 128] {
-        &self.bus.pia.ram
+    /// Access PIA RAM for observation (128 bytes at $0080–$00FF in flat memory).
+    pub fn ram(&self) -> &[u8] {
+        &self.bus.mem[0x80..0x100]
     }
 }
 

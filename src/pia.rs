@@ -28,19 +28,19 @@ pub struct Pia {
     pub ram: [u8; 128],
 
     // I/O ports
-    port_a_output: u8,
-    port_a_ddr: u8,
-    port_a_input: u8,
+    pub port_a_output: u8,
+    pub port_a_ddr: u8,
+    pub port_a_input: u8,
 
-    port_b_output: u8,
-    port_b_ddr: u8,
-    port_b_input: u8,
+    pub port_b_output: u8,
+    pub port_b_ddr: u8,
+    pub port_b_input: u8,
 
     // Timer
-    timer_value: u16,
-    timer_prescaler: u16,
-    timer_prescaler_select: u16,
-    timer_underflow: bool,
+    pub timer_value: u16,
+    pub timer_prescaler: u16,
+    pub timer_prescaler_select: u16,
+    pub timer_underflow: bool,
 }
 
 impl Default for Pia {
@@ -99,6 +99,69 @@ impl Pia {
             } else {
                 self.timer_value -= 1;
             }
+        }
+    }
+
+    /// Advance the timer by `n` CPU cycles in bulk.
+    /// Equivalent to calling `tick()` n times, but avoids the per-cycle loop.
+    pub fn tick_n(&mut self, n: u16) {
+        if n == 0 { return; }
+
+        // Post-underflow mode: timer just wraps through 0xFF each cycle
+        if self.timer_value == 0 && self.timer_underflow {
+            // Each tick sets timer_value = 0xFF, then next tick decrements.
+            // After n cycles: value = 0xFF - (n-1) wrapped to u8
+            self.timer_value = (0xFF_u16.wrapping_sub(n - 1)) & 0xFF;
+            return;
+        }
+
+        let mut remaining = n;
+
+        // Phase 1: Consume remaining prescaler ticks before first timer decrement
+        if self.timer_prescaler > 0 {
+            if remaining < self.timer_prescaler {
+                self.timer_prescaler -= remaining;
+                return;
+            }
+            remaining -= self.timer_prescaler;
+            self.timer_prescaler = 0;
+            // One timer tick happens now
+            if self.timer_value == 0 {
+                self.timer_underflow = true;
+                self.timer_value = 0xFF;
+                // Switch to 1-clock mode for remaining cycles
+                if remaining > 0 {
+                    self.timer_value = (0xFF_u16.wrapping_sub(remaining - 1)) & 0xFF;
+                }
+                return;
+            }
+            self.timer_value -= 1;
+        }
+
+        if remaining == 0 {
+            self.timer_prescaler = self.timer_prescaler_select;
+            return;
+        }
+
+        // Phase 2: Full prescaler periods
+        let ps = self.timer_prescaler_select;
+        let full_decrements = remaining / ps;
+        let leftover = remaining % ps;
+
+        if full_decrements >= self.timer_value as u16 {
+            // Will underflow during this batch
+            let cycles_to_zero = self.timer_value as u16 * ps;
+            remaining -= cycles_to_zero;
+            self.timer_value = 0;
+            self.timer_underflow = true;
+            self.timer_value = 0xFF;
+            // Remaining cycles in 1-clock post-underflow mode
+            if remaining > 0 {
+                self.timer_value = (0xFF_u16.wrapping_sub(remaining - 1)) & 0xFF;
+            }
+        } else {
+            self.timer_value -= full_decrements as u16;
+            self.timer_prescaler = ps - leftover;
         }
     }
 

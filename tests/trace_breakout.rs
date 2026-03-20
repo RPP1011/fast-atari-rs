@@ -1,5 +1,5 @@
 mod common;
-use stella_rs::atari::Atari;
+use fast_atari_rs::atari::Atari;
 
 #[test]
 fn trace_positions() {

@@ -1,7 +1,7 @@
 mod common;
 
-use stella_rs::atari::Atari;
-use stella_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT};
+use fast_atari_rs::atari::Atari;
+use fast_atari_rs::tia::{FRAME_WIDTH, FRAME_HEIGHT};
 
 /// Run our emulator for N frames and compare pixel-by-pixel
 /// against Gopher2600's reference output.

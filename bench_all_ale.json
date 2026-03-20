@@ -1,0 +1,650 @@
+[
+  {
+    "rom": "adventure",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 26473.1
+  },
+  {
+    "rom": "air_raid",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 24080.6
+  },
+  {
+    "rom": "alien",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 13682.6
+  },
+  {
+    "rom": "amidar",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 20581.4
+  },
+  {
+    "rom": "assault",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 28596.6
+  },
+  {
+    "rom": "asterix",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 26994.9
+  },
+  {
+    "rom": "asteroids",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 23794.7
+  },
+  {
+    "rom": "atlantis",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 20420.2
+  },
+  {
+    "rom": "atlantis2",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 20751.2
+  },
+  {
+    "rom": "backgammon",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21220.5
+  },
+  {
+    "rom": "bank_heist",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 25406.8
+  },
+  {
+    "rom": "basic_math",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 28578.0
+  },
+  {
+    "rom": "battle_zone",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 17283.5
+  },
+  {
+    "rom": "beam_rider",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 19402.1
+  },
+  {
+    "rom": "berzerk",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 24044.4
+  },
+  {
+    "rom": "blackjack",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 21139.5
+  },
+  {
+    "rom": "bowling",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 27148.0
+  },
+  {
+    "rom": "boxing",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 13684.4
+  },
+  {
+    "rom": "breakout",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 16599.5
+  },
+  {
+    "rom": "carnival",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 27502.6
+  },
+  {
+    "rom": "casino",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 13208.1
+  },
+  {
+    "rom": "centipede",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 23556.1
+  },
+  {
+    "rom": "chopper_command",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 16962.4
+  },
+  {
+    "rom": "combat",
+    "rom_size": 2048,
+    "status": "unsupported",
+    "fps": 0
+  },
+  {
+    "rom": "crazy_climber",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 28626.6
+  },
+  {
+    "rom": "crossbow",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 17667.0
+  },
+  {
+    "rom": "darkchambers",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 22179.8
+  },
+  {
+    "rom": "defender",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 28243.1
+  },
+  {
+    "rom": "demon_attack",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 27181.2
+  },
+  {
+    "rom": "donkey_kong",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 19154.0
+  },
+  {
+    "rom": "double_dunk",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 16756.3
+  },
+  {
+    "rom": "earthworld",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 28210.6
+  },
+  {
+    "rom": "elevator_action",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 22383.0
+  },
+  {
+    "rom": "enduro",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 15652.8
+  },
+  {
+    "rom": "entombed",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 25583.0
+  },
+  {
+    "rom": "et",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 24014.8
+  },
+  {
+    "rom": "fishing_derby",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 12008.4
+  },
+  {
+    "rom": "flag_capture",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 28545.3
+  },
+  {
+    "rom": "freeway",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 12110.8
+  },
+  {
+    "rom": "frogger",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 20507.8
+  },
+  {
+    "rom": "frostbite",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 17816.2
+  },
+  {
+    "rom": "galaxian",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 18530.0
+  },
+  {
+    "rom": "gopher",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 27669.5
+  },
+  {
+    "rom": "gravitar",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 24576.8
+  },
+  {
+    "rom": "hangman",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 24852.6
+  },
+  {
+    "rom": "haunted_house",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 27124.3
+  },
+  {
+    "rom": "hero",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 13758.8
+  },
+  {
+    "rom": "human_cannonball",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 20756.0
+  },
+  {
+    "rom": "ice_hockey",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 17013.0
+  },
+  {
+    "rom": "jamesbond",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 23137.0
+  },
+  {
+    "rom": "journey_escape",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 10804.6
+  },
+  {
+    "rom": "joust",
+    "rom_size": 8192,
+    "status": "unsupported",
+    "fps": 0
+  },
+  {
+    "rom": "kaboom",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 22392.6
+  },
+  {
+    "rom": "kangaroo",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 18134.0
+  },
+  {
+    "rom": "keystone_kapers",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 14953.7
+  },
+  {
+    "rom": "king_kong",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 19846.7
+  },
+  {
+    "rom": "klax",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 16518.0
+  },
+  {
+    "rom": "koolaid",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 16600.4
+  },
+  {
+    "rom": "krull",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 15252.0
+  },
+  {
+    "rom": "kung_fu_master",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 16736.6
+  },
+  {
+    "rom": "laser_gates",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 19431.6
+  },
+  {
+    "rom": "lost_luggage",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 26068.9
+  },
+  {
+    "rom": "mario_bros",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 23507.3
+  },
+  {
+    "rom": "maze_craze",
+    "rom_size": 4096,
+    "status": "unsupported",
+    "fps": 0
+  },
+  {
+    "rom": "miniature_golf",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 24520.4
+  },
+  {
+    "rom": "montezuma_revenge",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 19004.3
+  },
+  {
+    "rom": "mr_do",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 15990.9
+  },
+  {
+    "rom": "ms_pacman",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 21130.4
+  },
+  {
+    "rom": "name_this_game",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 19811.1
+  },
+  {
+    "rom": "othello",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 9216.1
+  },
+  {
+    "rom": "pacman",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 18202.9
+  },
+  {
+    "rom": "phoenix",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 30162.2
+  },
+  {
+    "rom": "pitfall",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 18339.6
+  },
+  {
+    "rom": "pitfall2",
+    "rom_size": 10495,
+    "status": "ok",
+    "fps": 10220.7
+  },
+  {
+    "rom": "pong",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 23076.5
+  },
+  {
+    "rom": "pooyan",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 18865.3
+  },
+  {
+    "rom": "private_eye",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 16536.5
+  },
+  {
+    "rom": "qbert",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21586.6
+  },
+  {
+    "rom": "riverraid",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 17855.9
+  },
+  {
+    "rom": "road_runner",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 16092.1
+  },
+  {
+    "rom": "robotank",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 13344.2
+  },
+  {
+    "rom": "seaquest",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21580.2
+  },
+  {
+    "rom": "sir_lancelot",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 23878.6
+  },
+  {
+    "rom": "skiing",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 20250.3
+  },
+  {
+    "rom": "solaris",
+    "rom_size": 16384,
+    "status": "ok",
+    "fps": 13927.6
+  },
+  {
+    "rom": "space_invaders",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21509.6
+  },
+  {
+    "rom": "space_war",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 25032.4
+  },
+  {
+    "rom": "star_gunner",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 32581.7
+  },
+  {
+    "rom": "superman",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 31733.2
+  },
+  {
+    "rom": "surround",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 25143.8
+  },
+  {
+    "rom": "tennis",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 18110.7
+  },
+  {
+    "rom": "tetris",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 14429.2
+  },
+  {
+    "rom": "tic_tac_toe_3d",
+    "rom_size": 2048,
+    "status": "ok",
+    "fps": 13562.0
+  },
+  {
+    "rom": "time_pilot",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 24840.0
+  },
+  {
+    "rom": "trondead",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21798.1
+  },
+  {
+    "rom": "turmoil",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 29376.9
+  },
+  {
+    "rom": "tutankham",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 22492.0
+  },
+  {
+    "rom": "up_n_down",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 9686.8
+  },
+  {
+    "rom": "venture",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 21652.5
+  },
+  {
+    "rom": "video_checkers",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 11225.4
+  },
+  {
+    "rom": "video_chess",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 15546.6
+  },
+  {
+    "rom": "video_cube",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 11894.0
+  },
+  {
+    "rom": "video_pinball",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 13396.8
+  },
+  {
+    "rom": "warlords",
+    "rom_size": 4096,
+    "status": "unsupported",
+    "fps": 0
+  },
+  {
+    "rom": "wizard_of_wor",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 22524.7
+  },
+  {
+    "rom": "word_zapper",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 22566.0
+  },
+  {
+    "rom": "yars_revenge",
+    "rom_size": 4096,
+    "status": "ok",
+    "fps": 22830.3
+  },
+  {
+    "rom": "zaxxon",
+    "rom_size": 8192,
+    "status": "ok",
+    "fps": 20364.8
+  }
+]
