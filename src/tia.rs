@@ -74,14 +74,38 @@ pub const FRAME_HEIGHT: usize = VISIBLE_HEIGHT as usize;
 /// Display width after correcting for non-square TIA pixels (2x horizontal).
 pub const DISPLAY_WIDTH: usize = FRAME_WIDTH * 2;
 
+// Gopher2600 NTSC visible area bounds (from specification/specifications.go)
+const EXTENDED_VISIBLE_TOP: u16 = 23;
+const IDEAL_VISIBLE_TOP: u16 = 32;
+const FRAMES_UNTIL_RESIZE: u8 = 3;
+
+/// Fixed-size queue of delayed register writes.
+const DELAYED_CAP: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DelayedEntry {
+    remaining: u8,
+    register: u8,
+    value: u8,
+}
+
 #[derive(Clone, Debug)]
 pub struct Tia {
     // Scanline tracking
     pub clock: u16,       // TIA clock within current scanline (0–227)
     pub scanline: u16,    // current scanline (0–261)
-    pub render_line: u16, // current framebuffer row being written (0–191)
     pub wsync: bool,      // CPU halted until end of scanline
     pub hmove_pending: bool, // HMOVE was written this scanline — extend HBLANK by 8 clocks
+
+    // Dynamic visible-area resizer (matches Gopher2600's resizer.go)
+    pub visible_top: u16,
+    vblank_top: u16,
+    pending_top: u16,
+    pending_frames: u8,
+
+    // Delayed register writes — small FIFO marched each tick
+    delayed: [DelayedEntry; DELAYED_CAP],
+    delayed_len: u8,
 
     // Framebuffer: 160 x 192, one byte per pixel (NTSC palette index)
     pub framebuffer: Box<[u8; FRAME_WIDTH * FRAME_HEIGHT]>,
@@ -141,12 +165,15 @@ pub struct Tia {
     // Paddle inputs (0-255 position, converted to charge timing)
     pub paddle0: u8,
     pub paddle1: u8,
-    pub paddle_counter: u16, // counts up each scanline after VBLANK dump
+    pub paddle_counter: u16,
     pub paddle_dumped: bool,
 
     // Input latches
-    pub inpt4: bool, // P0 fire button (active low)
-    pub inpt5: bool, // P1 fire button (active low)
+    pub inpt4: bool,
+    pub inpt5: bool,
+    pub inpt4_latch: u8,
+    pub inpt5_latch: u8,
+    pub input_latch_enabled: bool,
 }
 
 impl Default for Tia {
@@ -154,9 +181,14 @@ impl Default for Tia {
         Self {
             clock: 0,
             scanline: 0,
-            render_line: 0,
             wsync: false,
             hmove_pending: false,
+            visible_top: IDEAL_VISIBLE_TOP,
+            vblank_top: SCANLINES_PER_FRAME,
+            pending_top: IDEAL_VISIBLE_TOP,
+            pending_frames: 0,
+            delayed: [DelayedEntry::default(); DELAYED_CAP],
+            delayed_len: 0,
             framebuffer: Box::new([0; FRAME_WIDTH * FRAME_HEIGHT]),
             frame_complete: false,
             vsync: 0,
@@ -180,6 +212,8 @@ impl Default for Tia {
             paddle0: 128, paddle1: 128,
             paddle_counter: 0, paddle_dumped: false,
             inpt4: true, inpt5: true,
+            inpt4_latch: 0x80, inpt5_latch: 0x80,
+            input_latch_enabled: false,
         }
     }
 }
@@ -207,25 +241,94 @@ impl Tia {
         }
     }
 
+    /// Commit the dynamic resizer: adopt pending visible_top after stable frames.
+    /// Matches Gopher2600's resizer: clamp VBLANK-off scanline to NTSC bounds.
+    /// Once stable, VisibleTop only expands (decreases), never shrinks.
+    fn resize_commit(&mut self) {
+        if self.vblank_top > SCANLINES_PER_FRAME { return; }
+
+        let clamped = self.vblank_top.clamp(EXTENDED_VISIBLE_TOP, IDEAL_VISIBLE_TOP);
+
+        // Only adopt if it EXPANDS (lowers) the visible area
+        let candidate = clamped.min(self.visible_top);
+
+        if candidate != self.pending_top {
+            self.pending_top = candidate;
+            self.pending_frames = FRAMES_UNTIL_RESIZE;
+        } else if self.pending_frames > 0 {
+            self.pending_frames -= 1;
+            if self.pending_frames == 0 {
+                self.visible_top = self.pending_top;
+            }
+        }
+
+        // Reset per-frame tracker to current visible_top (not sentinel),
+        // so next frame only detects VBLANK-off ABOVE the current top.
+        self.vblank_top = self.visible_top;
+    }
+
     /// Advance the TIA by one TIA clock (3 per CPU cycle).
-    /// Renders pixels, detects collisions, and tracks scanline/frame progress.
     pub fn tick(&mut self) {
-        // HBLANK boundary: normally clock 68, extended to 76 after HMOVE
-        let hblank_end = if self.hmove_pending { 76 } else { 68 };
-        let pixel_x = self.clock.wrapping_sub(hblank_end);
+        // Update input latches
+        if self.input_latch_enabled {
+            if !self.inpt4 { self.inpt4_latch = 0x00; }
+            if !self.inpt5 { self.inpt5_latch = 0x00; }
+        }
+
+        // Track VBLANK state for resizer (every tick, like Gopher2600)
+        if self.vblank & 0x02 == 0
+            && self.scanline >= EXTENDED_VISIBLE_TOP
+            && self.scanline < self.vblank_top
+        {
+            self.vblank_top = self.scanline;
+        }
+
+        // Process delayed writes BEFORE rendering
+        if self.delayed_len > 0 {
+            let mut dst = 0usize;
+            for i in 0..self.delayed_len as usize {
+                let e = &mut self.delayed[i];
+                e.remaining -= 1;
+                if e.remaining == 0 {
+                    match e.register {
+                        0x0D => self.pf0 = e.value,
+                        0x0E => self.pf1 = e.value,
+                        0x0F => self.pf2 = e.value,
+                        _ => {}
+                    }
+                } else {
+                    if dst != i {
+                        self.delayed[dst] = *e;
+                    }
+                    dst += 1;
+                }
+            }
+            self.delayed_len = dst as u8;
+        }
+
+        // Pixel coordinate always relative to clock 68
+        let pixel_x = self.clock.wrapping_sub(68);
+        let vis_line = self.scanline.wrapping_sub(self.visible_top);
 
         // Render pixel if in visible area and not blanked
-        if self.clock >= hblank_end && pixel_x < FRAME_WIDTH as u16
+        if self.clock >= 68 && pixel_x < FRAME_WIDTH as u16
             && self.vblank & 0x02 == 0
-            && self.render_line < FRAME_HEIGHT as u16
+            && vis_line < FRAME_HEIGHT as u16
         {
             let x = pixel_x as u8;
             let (color, p0, p1, m0, m1, bl, pf) = self.compute_pixel(x);
 
-            let idx = self.render_line as usize * FRAME_WIDTH + pixel_x as usize;
-            self.framebuffer[idx] = color;
+            // HMOVE comb: blank first 8 pixels when HMOVE is pending
+            let final_color = if self.hmove_pending && pixel_x < 8 {
+                self.colubk
+            } else {
+                color
+            };
 
-            // Collision detection — latch bits (only during visible area)
+            let idx = vis_line as usize * FRAME_WIDTH + pixel_x as usize;
+            self.framebuffer[idx] = final_color;
+
+            // Collision detection
             if m0 && p1 { self.cxm0p |= 0x80; }
             if m0 && p0 { self.cxm0p |= 0x40; }
             if m1 && p0 { self.cxm1p |= 0x80; }
@@ -250,8 +353,9 @@ impl Tia {
             self.wsync = false;
             self.hmove_pending = false;
 
-            if self.vblank & 0x02 == 0 && self.render_line < FRAME_HEIGHT as u16 {
-                self.render_line += 1;
+            // Clear framebuffer at the start of the visible area
+            if self.scanline == self.visible_top {
+                self.framebuffer.fill(0);
             }
 
             if !self.paddle_dumped && self.paddle_counter < 256 {
@@ -268,7 +372,6 @@ impl Tia {
     }
 
     /// Compute pixel color and per-object hit flags at visible column `x`.
-    /// Returns (color, p0_hit, p1_hit, m0_hit, m1_hit, bl_hit, pf_hit).
     fn compute_pixel(&self, x: u8) -> (u8, bool, bool, bool, bool, bool, bool) {
         let pf = self.get_playfield_bit(x);
         let p0 = self.get_player_pixel(0, x);
@@ -330,23 +433,21 @@ impl Tia {
         if grp == 0 { return false; }
 
         let size_mode = nusiz & 0x07;
-        // Player pixel width: 1 for normal, 2 for double, 4 for quad
         let pixel_width: u16 = match size_mode {
-            5 => 2, // double-size
-            7 => 4, // quad-size
-            _ => 1, // normal
+            5 => 2,
+            7 => 4,
+            _ => 1,
         };
 
-        // Copy positions relative to base position
         let copy_offsets: &[u16] = match size_mode {
-            0 => &[0],                // one copy
-            1 => &[0, 16],            // two copies, close
-            2 => &[0, 32],            // two copies, medium
-            3 => &[0, 16, 32],        // three copies, close
-            4 => &[0, 64],            // two copies, wide
-            5 => &[0],                // one copy, double-size
-            6 => &[0, 32, 64],        // three copies, medium
-            7 => &[0],                // one copy, quad-size
+            0 => &[0],
+            1 => &[0, 16],
+            2 => &[0, 32],
+            3 => &[0, 16, 32],
+            4 => &[0, 64],
+            5 => &[0],
+            6 => &[0, 32, 64],
+            7 => &[0],
             _ => &[0],
         };
 
@@ -377,10 +478,8 @@ impl Tia {
 
         if !enabled || resmp { return false; }
 
-        // Missile width from NUSIZ bits 4-5
         let width: u16 = 1 << ((nusiz >> 4) & 0x03);
 
-        // Missile copies follow the same pattern as its player
         let copy_offsets: &[u16] = match nusiz & 0x07 {
             0 | 5 | 7 => &[0],
             1 => &[0, 16],
@@ -407,21 +506,34 @@ impl Tia {
         let enabled = if self.vdelbl { self.enabl_old } else { self.enabl };
         if !enabled { return false; }
 
-        // Ball width from CTRLPF bits 4-5
         let width: u16 = 1 << ((self.ctrlpf >> 4) & 0x03);
         let offset = ((x as u16) + 160 - self.pos_bl) % 160;
         offset < width && offset < 80
     }
 
+    /// Polycounter RESP position for players.
+    /// The draw position wraps around the full 228-clock scanline.
+    fn calc_resp_position(&self) -> u16 {
+        let delay: u16 = if self.clock < 68 { 3 } else { 4 };
+        let draw_clock = (self.clock + delay + 156) % 228;
+        if draw_clock >= 68 {
+            (draw_clock - 68) as u16
+        } else {
+            (draw_clock + 160 - 68) as u16
+        }
+    }
+
+    /// Simple RESP position for missiles and ball.
+    fn calc_resp_position_simple(&self) -> u16 {
+        ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16
+    }
+
     fn apply_hmove_offset(pos: u16, hm: u8) -> u16 {
-        // HM values are 4-bit signed in the upper nibble: -8 to +7
-        // Arithmetic right shift of the signed byte gives proper sign extension
         let offset = (hm as i8) >> 4;
-        // Positive = move left (subtract), negative = move right (add)
         ((pos as i16 - offset as i16).rem_euclid(160)) as u16
     }
 
-    /// Read a TIA register. `addr` is the raw CPU address ($00–$0D range).
+    /// Read a TIA register.
     pub fn read(&self, addr: u16) -> u8 {
         match addr & 0x0F {
             0x00 => self.cxm0p,
@@ -432,46 +544,59 @@ impl Tia {
             0x05 => self.cxm1fb,
             0x06 => self.cxblpf,
             0x07 => self.cxppmm,
-            // Paddle inputs: bit 7 goes high when paddle_counter >= paddle position
             0x08 => if self.paddle_counter >= self.paddle0 as u16 { 0x80 } else { 0x00 },
             0x09 => if self.paddle_counter >= self.paddle1 as u16 { 0x80 } else { 0x00 },
-            0x0A => 0x80, // INPT2 — unused paddle, always charged
-            0x0B => 0x80, // INPT3 — unused paddle, always charged
-            0x0C => if self.inpt4 { 0x80 } else { 0x00 },
-            0x0D => if self.inpt5 { 0x80 } else { 0x00 },
+            0x0A => 0x80,
+            0x0B => 0x80,
+            0x0C => {
+                if self.input_latch_enabled {
+                    self.inpt4_latch
+                } else {
+                    if self.inpt4 { 0x80 } else { 0x00 }
+                }
+            }
+            0x0D => {
+                if self.input_latch_enabled {
+                    self.inpt5_latch
+                } else {
+                    if self.inpt5 { 0x80 } else { 0x00 }
+                }
+            }
             _ => 0,
         }
     }
 
-    /// Write a TIA register. `addr` is the raw CPU address ($00–$2C range).
+    /// Write a TIA register.
     pub fn write(&mut self, addr: u16, val: u8) {
         match addr & 0x3F {
             0x00 => {
-                // When VSYNC is turned on (bit 1: 0→1), signal start of new frame
                 if self.vsync & 0x02 == 0 && val & 0x02 != 0 {
+                    self.resize_commit();
                     self.scanline = 0;
                     self.frame_complete = true;
                 }
                 self.vsync = val;
             }
             0x01 => {
-                // When VBLANK is turned off (bit 1: 1→0), start rendering visible area
-                if self.vblank & 0x02 != 0 && val & 0x02 == 0 {
-                    self.render_line = 0;
-                    self.framebuffer.fill(0);
+                // Bit 6: input latch control
+                if val & 0x40 != 0 {
+                    self.input_latch_enabled = true;
+                    self.inpt4_latch = 0x80;
+                    self.inpt5_latch = 0x80;
+                } else {
+                    self.input_latch_enabled = false;
                 }
-                // Bit 7: dump paddle capacitors (reset charge timer)
+                // Bit 7: dump paddle capacitors
                 if val & 0x80 != 0 {
                     self.paddle_counter = 0;
                     self.paddle_dumped = true;
                 } else if self.paddle_dumped {
                     self.paddle_dumped = false;
-                    // Start charging — counter will increment each scanline
                 }
                 self.vblank = val;
             }
             0x02 => self.wsync = true,
-            0x03 => {} // RSYNC — rarely used
+            0x03 => {}
             0x04 => self.nusiz0 = val,
             0x05 => self.nusiz1 = val,
             0x06 => self.colup0 = val,
@@ -481,14 +606,29 @@ impl Tia {
             0x0A => self.ctrlpf = val,
             0x0B => self.refp0 = val & 0x08 != 0,
             0x0C => self.refp1 = val & 0x08 != 0,
-            0x0D => self.pf0 = val,
-            0x0E => self.pf1 = val,
-            0x0F => self.pf2 = val,
-            0x10 => self.pos_p0 = ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16,
-            0x11 => self.pos_p1 = ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16,
-            0x12 => self.pos_m0 = ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16,
-            0x13 => self.pos_m1 = ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16,
-            0x14 => self.pos_bl = ((self.clock as i16 - 68 + 5).rem_euclid(160)) as u16,
+            0x0D | 0x0E | 0x0F => {
+                // PF delayed writes — FIFO queue, fires after 1 tick
+                let idx = self.delayed_len as usize;
+                if idx < DELAYED_CAP {
+                    self.delayed[idx] = DelayedEntry {
+                        remaining: 1,
+                        register: (addr & 0x3F) as u8,
+                        value: val,
+                    };
+                    self.delayed_len += 1;
+                } else {
+                    match addr & 0x3F {
+                        0x0D => self.pf0 = val,
+                        0x0E => self.pf1 = val,
+                        _ => self.pf2 = val,
+                    }
+                }
+            }
+            0x10 => self.pos_p0 = self.calc_resp_position(),
+            0x11 => self.pos_p1 = self.calc_resp_position(),
+            0x12 => self.pos_m0 = self.calc_resp_position_simple(),
+            0x13 => self.pos_m1 = self.calc_resp_position_simple(),
+            0x14 => self.pos_bl = self.calc_resp_position_simple(),
             0x15 => {} // AUDC0
             0x16 => {} // AUDC1
             0x17 => {} // AUDF0
@@ -511,7 +651,6 @@ impl Tia {
             0x28 => self.resmp0 = val & 0x02 != 0,
             0x29 => self.resmp1 = val & 0x02 != 0,
             0x2A => {
-                // HMOVE — apply horizontal motion and extend HBLANK by 8 clocks
                 self.pos_p0 = Self::apply_hmove_offset(self.pos_p0, self.hmp0);
                 self.pos_p1 = Self::apply_hmove_offset(self.pos_p1, self.hmp1);
                 self.pos_m0 = Self::apply_hmove_offset(self.pos_m0, self.hmm0);
@@ -520,13 +659,11 @@ impl Tia {
                 self.hmove_pending = true;
             }
             0x2B => {
-                // HMCLR
                 self.hmp0 = 0; self.hmp1 = 0;
                 self.hmm0 = 0; self.hmm1 = 0;
                 self.hmbl = 0;
             }
             0x2C => {
-                // CXCLR
                 self.cxm0p = 0; self.cxm1p = 0;
                 self.cxp0fb = 0; self.cxp1fb = 0;
                 self.cxm0fb = 0; self.cxm1fb = 0;

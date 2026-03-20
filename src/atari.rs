@@ -111,6 +111,7 @@ pub struct Bus {
     pub rom: Vec<u8>,
     pub bank: usize,
     pub scheme: BankScheme,
+    pub bus_ticks: u32,
 }
 
 impl Bus {
@@ -129,6 +130,7 @@ impl Bus {
             rom,
             bank,
             scheme,
+            bus_ticks: 0,
         }
     }
 
@@ -178,34 +180,49 @@ impl Bus {
     }
 }
 
+impl Bus {
+    #[inline]
+    fn tick_cycle(&mut self) {
+        self.tia.tick();
+        self.tia.tick();
+        self.tia.tick();
+        self.pia.tick();
+        self.bus_ticks += 1;
+    }
+}
+
 impl Memory for Bus {
     fn read(&mut self, addr: u16) -> u8 {
         self.check_bankswitch(addr);
-        match addr & 0x1FFF {
-            // TIA read registers: $00–$0D (active when A12=0, A7=0)
+        let val = match addr & 0x1FFF {
             a if a & 0x1080 == 0x0000 => self.tia.read(a),
-            // PIA RAM: $80–$FF (A12=0, A9=0, A7=1)
             a if a & 0x1280 == 0x0080 => self.pia.read(a),
-            // PIA I/O: $280–$29F (A12=0, A9=1)
             a if a & 0x1280 == 0x0280 => self.pia.read(a),
-            // Cartridge ROM: $1000–$1FFF (A12=1)
             a if a & 0x1000 == 0x1000 => self.rom_read(a),
             _ => 0,
-        }
+        };
+        self.tick_cycle();
+        val
     }
 
     fn write(&mut self, addr: u16, val: u8) {
+        // Gopher2600 model: 2 ticks, write on 3rd clock, 1 tick after
+        self.tia.tick();
+        self.tia.tick();
         self.check_bankswitch(addr);
         match addr & 0x1FFF {
-            // TIA write registers: $00–$2C (A12=0, A7=0)
             a if a & 0x1080 == 0x0000 => self.tia.write(a, val),
-            // PIA RAM: $80–$FF
             a if a & 0x1280 == 0x0080 => self.pia.write(a, val),
-            // PIA I/O: $280–$29F
             a if a & 0x1280 == 0x0280 => self.pia.write(a, val),
             _ => {}
         }
+        self.tia.tick();
+        self.pia.tick();
+        self.bus_ticks += 1;
     }
+
+    fn tick(&mut self) { self.tick_cycle(); }
+    fn tick_count(&self) -> u32 { self.bus_ticks }
 }
 
 /// Atari 2600 console.
@@ -289,43 +306,14 @@ impl Atari {
         cycles
     }
 
-    /// Execute one CPU step with interleaved TIA/PIA ticking.
-    ///
-    /// On real hardware the TIA beam advances continuously during CPU
-    /// execution, and register writes take effect on the last cycle.
-    /// We approximate this by ticking TIA for (N-1) cycles before the
-    /// write, then 1 cycle after — so the write lands near the end of
-    /// the instruction, matching real hardware behavior.
     #[inline]
     fn run_one_cycle(&mut self, cycles: &mut u64) {
         if self.bus.tia.wsync {
             self.tick_components();
             *cycles += 1;
         } else {
-            // Peek at opcode to get cycle count before executing
-            let op = crate::cpu::OpCode::decode(&mut self.bus, self.cpu.pc);
-            let c = match &op {
-                Some(op) => {
-                    let d = op.details();
-                    d.cycle_count as u64
-                }
-                None => 2, // fallback
-            };
-
-            // Tick TIA for (c-1) cycles — beam advances to just before the write
-            for _ in 0..c.saturating_sub(1) {
-                self.tick_components();
-            }
-
-            // Execute the instruction — register writes happen here
-            let actual_c = self.cpu.step(&mut self.bus) as u64;
-            *cycles += actual_c;
-
-            // Tick the remaining cycle(s) after the write
-            let remaining = actual_c.saturating_sub(c.saturating_sub(1));
-            for _ in 0..remaining {
-                self.tick_components();
-            }
+            let c = self.cpu.step(&mut self.bus) as u64;
+            *cycles += c;
         }
     }
 

@@ -1,8 +1,13 @@
-/// OpCode : http://www.6502.org/tutorials/6502opcodes.html
+/// Cycle-accurate 6502 CPU emulator.
+///
+/// Every CPU cycle produces exactly one bus operation: `memory.read()`,
+/// `memory.write()`, or `memory.tick()`. This keeps external hardware
+/// (TIA, PIA) advancing in lockstep with the CPU.
 
+// ---------------------------------------------------------------------------
+// Status flags
+// ---------------------------------------------------------------------------
 
-/// 6502 CPU status flags packed into a single byte.
-/// Bit layout: NV-BDIZC (bit 5 is unused, always set on push).
 macro_rules! flags {
     ($($name:ident = $bit:expr),* $(,)?) => {
         $(pub const $name: u8 = 1 << $bit;)*
@@ -46,448 +51,67 @@ impl Status {
     }
 }
 
-pub struct OpCodeDetails {
-    pub cycle_count: u8,
-    pub extra_cycle_on_page_bound_cross: bool,
+// ---------------------------------------------------------------------------
+// Memory trait
+// ---------------------------------------------------------------------------
+
+pub trait Memory {
+    fn read(&mut self, addr: u16) -> u8;
+    fn write(&mut self, addr: u16, val: u8);
+    fn tick(&mut self) {}
+    fn tick_count(&self) -> u32 { 0 }
 }
 
-macro_rules! opcodes {
-    // Internal: construct variant value during decode (dispatched by optional operand type)
-    (@decode $variant:ident, $mem:expr, $pc:expr) => {
-        Self::$variant
-    };
-    (@decode $variant:ident, u8, $mem:expr, $pc:expr) => {
-        Self::$variant($mem.read($pc + 1))
-    };
-    (@decode $variant:ident, u16, $mem:expr, $pc:expr) => {
-        Self::$variant({
-            let lo = $mem.read($pc + 1) as u16;
-            let hi = $mem.read($pc + 2) as u16;
-            (hi << 8) | lo
-        })
-    };
+// ---------------------------------------------------------------------------
+// FlatMemory (test helper)
+// ---------------------------------------------------------------------------
 
-    // Internal: wildcard pattern for match arms
-    (@pat $variant:ident) => { Self::$variant };
-    (@pat $variant:ident, u8) => { Self::$variant(_) };
-    (@pat $variant:ident, u16) => { Self::$variant(_) };
-
-    // Internal: instruction size in bytes (opcode + operand)
-    (@size) => { 1u16 };
-    (@size u8) => { 2u16 };
-    (@size u16) => { 3u16 };
-
-    // Entry point
-    // No operand:   `Foo         = 0xNN => (cycles, extra_cycle)`
-    // Byte operand: `Foo(u8)     = 0xNN => (cycles, extra_cycle)`
-    // Word operand: `Foo(u16)    = 0xNN => (cycles, extra_cycle)`
-    ($( $(#[$meta:meta])* $variant:ident $(($operand:tt))? = $hex:expr => ($cc:expr, $ec:expr) ),* $(,)?) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub enum OpCode {
-            $( $(#[$meta])* $variant $(($operand))? ),*
-        }
-
-        impl OpCode {
-            pub fn decode<M: Memory>(memory: &mut M, pc: u16) -> Option<Self> {
-                let byte = memory.read(pc);
-                match byte {
-                    $( $hex => Some(opcodes!(@decode $variant, $($operand,)? memory, pc)), )*
-                    _ => None,
-                }
-            }
-
-            pub fn hex(&self) -> u8 {
-                match self {
-                    $( opcodes!(@pat $variant $(,$operand)?) => $hex, )*
-                }
-            }
-
-            pub fn size(&self) -> u16 {
-                match self {
-                    $( opcodes!(@pat $variant $(,$operand)?) => opcodes!(@size $($operand)?), )*
-                }
-            }
-
-            pub fn details(&self) -> OpCodeDetails {
-                match self {
-                    $( opcodes!(@pat $variant $(,$operand)?) => OpCodeDetails {
-                        cycle_count: $cc,
-                        extra_cycle_on_page_bound_cross: $ec,
-                    }, )*
-                }
-            }
-        }
-    };
+pub struct FlatMemory {
+    pub ram: [u8; 0x10000],
 }
 
-opcodes! {
-    /// BRK (BReaK)
-    /// Affects Flags: B
-    ///
-    /// BRK causes a non-maskable interrupt and increments the program counter
-    /// by one. Therefore an RTI will go to the address of the BRK +2 so that
-    /// BRK may be used to replace a two-Byte instruction for debugging and the
-    /// subsequent RTI will be correct.
-    BrkImplied     = 0x00 => (7, false),
-
-    /// ORA (bitwise OR with Accumulator)
-    /// Affects Flags: N Z
-    OraIndirectX   (u8) = 0x01 => (6, false),
-    OraZeroPage    (u8) = 0x05 => (3, false),
-    OraImmediate   (u8) = 0x09 => (2, false),
-    OraAbsolute    (u16) = 0x0D => (4, false),
-    OraIndirectY   (u8) = 0x11 => (5, true),
-    OraZeroPageX   (u8) = 0x15 => (4, false),
-    OraAbsoluteY   (u16) = 0x19 => (4, true),
-    OraAbsoluteX   (u16) = 0x1D => (4, true),
-
-    /// ASL (Arithmetic Shift Left)
-    /// Affects Flags: N Z C
-    ///
-    /// ASL shifts all bits left one position. 0 is shifted into bit 0 and the
-    /// original bit 7 is shifted into the Carry.
-    AslZeroPage    (u8) = 0x06 => (5, false),
-    AslAccumulator = 0x0A => (2, false),
-    AslAbsolute    (u16) = 0x0E => (6, false),
-    AslZeroPageX   (u8) = 0x16 => (6, false),
-    AslAbsoluteX   (u16) = 0x1E => (7, false),
-
-    /// PHP (PusH Processor status) / PLP (PuLl Processor status)
-    /// Stack Instructions — implied mode, one Byte.
-    PhpImplied     = 0x08 => (3, false),
-    PlpImplied     = 0x28 => (4, false),
-
-    /// Branch Instructions
-    /// Affect Flags: None
-    ///
-    /// All branches are relative mode and have a length of two Bytes.
-    /// A branch not taken requires two machine cycles. Add one if the branch
-    /// is taken and add one more if the branch crosses a page boundary.
-    BplRelative    (u8) = 0x10 => (2, true),  // Branch on PLus
-    BmiRelative    (u8) = 0x30 => (2, true),  // Branch on MInus
-
-    /// Flag (Processor Status) Instructions
-    /// These instructions are implied mode, have a length of one Byte and
-    /// require two machine cycles.
-    ClcImplied     = 0x18 => (2, false),  // CLear Carry
-    SecImplied     = 0x38 => (2, false),  // SEt Carry
-
-    /// JSR (Jump to SubRoutine)
-    /// Affects Flags: None
-    ///
-    /// JSR pushes the address-1 of the next operation on to the stack before
-    /// transferring program control to the following address. Subroutines are
-    /// normally terminated by a RTS op code.
-    JsrAbsolute    (u16) = 0x20 => (6, false),
-
-    /// AND (bitwise AND with accumulator)
-    /// Affects Flags: N Z
-    AndIndirectX   (u8) = 0x21 => (6, false),
-    AndZeroPage    (u8) = 0x25 => (3, false),
-    AndImmediate   (u8) = 0x29 => (2, false),
-    AndAbsolute    (u16) = 0x2D => (4, false),
-    AndIndirectY   (u8) = 0x31 => (5, true),
-    AndZeroPageX   (u8) = 0x35 => (4, false),
-    AndAbsoluteY   (u16) = 0x39 => (4, true),
-    AndAbsoluteX   (u16) = 0x3D => (4, true),
-
-    /// BIT (test BITs)
-    /// Affects Flags: N V Z
-    ///
-    /// BIT sets the Z flag as though the value in the address tested were ANDed
-    /// with the accumulator. The N and V flags are set to match bits 7 and 6
-    /// respectively in the value stored at the tested address.
-    BitZeroPage    (u8) = 0x24 => (3, false),
-    BitAbsolute    (u16) = 0x2C => (4, false),
-
-    /// ROL (ROtate Left)
-    /// Affects Flags: N Z C
-    ///
-    /// ROL shifts all bits left one position. The Carry is shifted into bit 0
-    /// and the original bit 7 is shifted into the Carry.
-    RolZeroPage    (u8) = 0x26 => (5, false),
-    RolAccumulator = 0x2A => (2, false),
-    RolAbsolute    (u16) = 0x2E => (6, false),
-    RolZeroPageX   (u8) = 0x36 => (6, false),
-    RolAbsoluteX   (u16) = 0x3E => (7, false),
-
-    /// RTI (ReTurn from Interrupt)
-    /// Affects Flags: all
-    ///
-    /// RTI retrieves the Processor Status Word (flags) and the Program Counter
-    /// from the stack in that order (interrupts push the PC first and then the
-    /// PSW). Note that unlike RTS, the return address on the stack is the
-    /// actual address rather than the address-1.
-    RtiImplied     = 0x40 => (6, false),
-
-    /// EOR (bitwise Exclusive OR)
-    /// Affects Flags: N Z
-    EorIndirectX   (u8) = 0x41 => (6, false),
-    EorZeroPage    (u8) = 0x45 => (3, false),
-    EorImmediate   (u8) = 0x49 => (2, false),
-    EorAbsolute    (u16) = 0x4D => (4, false),
-    EorIndirectY   (u8) = 0x51 => (5, true),
-    EorZeroPageX   (u8) = 0x55 => (4, false),
-    EorAbsoluteY   (u16) = 0x59 => (4, true),
-    EorAbsoluteX   (u16) = 0x5D => (4, true),
-
-    /// LSR (Logical Shift Right)
-    /// Affects Flags: N Z C
-    ///
-    /// LSR shifts all bits right one position. 0 is shifted into bit 7 and the
-    /// original bit 0 is shifted into the Carry.
-    LsrZeroPage    (u8) = 0x46 => (5, false),
-    LsrAccumulator = 0x4A => (2, false),
-    LsrAbsolute    (u16) = 0x4E => (6, false),
-    LsrZeroPageX   (u8) = 0x56 => (6, false),
-    LsrAbsoluteX   (u16) = 0x5E => (7, false),
-
-    /// PHA (PusH Accumulator) / PLA (PuLl Accumulator)
-    /// Stack Instructions — implied mode, one Byte.
-    PhaImplied     = 0x48 => (3, false),
-    PlaImplied     = 0x68 => (4, false),
-
-    /// JMP (JuMP)
-    /// Affects Flags: None
-    ///
-    /// JMP transfers program execution to the following address (absolute) or
-    /// to the location contained in the following address (indirect). Note that
-    /// there is no carry associated with the indirect jump so an indirect jump
-    /// must never use a vector beginning on the last Byte of a page.
-    JmpAbsolute    (u16) = 0x4C => (3, false),
-    JmpIndirect    (u16) = 0x6C => (5, false),
-
-    /// BVC/BVS — Branch on oVerflow Clear / Set
-    BvcRelative    (u8) = 0x50 => (2, true),
-    BvsRelative    (u8) = 0x70 => (2, true),
-
-    /// CLI (CLear Interrupt) / SEI (SEt Interrupt)
-    CliImplied     = 0x58 => (2, false),
-    SeiImplied     = 0x78 => (2, false),
-
-    /// RTS (ReTurn from Subroutine)
-    /// Affects Flags: None
-    ///
-    /// RTS pulls the top two Bytes off the stack (low Byte first) and transfers
-    /// program control to that address+1. It is used to exit a subroutine
-    /// invoked via JSR which pushed the address-1.
-    RtsImplied     = 0x60 => (6, false),
-
-    /// ADC (ADd with Carry)
-    /// Affects Flags: N V Z C
-    ///
-    /// ADC results are dependant on the setting of the decimal flag. In decimal
-    /// mode, addition is carried out on the assumption that the values involved
-    /// are packed BCD (Binary Coded Decimal).
-    /// There is no way to add without carry.
-    AdcIndirectX   (u8) = 0x61 => (6, false),
-    AdcZeroPage    (u8) = 0x65 => (3, false),
-    AdcImmediate   (u8) = 0x69 => (2, false),
-    AdcAbsolute    (u16) = 0x6D => (4, false),
-    AdcIndirectY   (u8) = 0x71 => (5, true),
-    AdcZeroPageX   (u8) = 0x75 => (4, false),
-    AdcAbsoluteY   (u16) = 0x79 => (4, true),
-    AdcAbsoluteX   (u16) = 0x7D => (4, true),
-
-    /// ROR (ROtate Right)
-    /// Affects Flags: N Z C
-    ///
-    /// ROR shifts all bits right one position. The Carry is shifted into bit 7
-    /// and the original bit 0 is shifted into the Carry.
-    RorZeroPage    (u8) = 0x66 => (5, false),
-    RorAccumulator = 0x6A => (2, false),
-    RorAbsolute    (u16) = 0x6E => (6, false),
-    RorZeroPageX   (u8) = 0x76 => (6, false),
-    RorAbsoluteX   (u16) = 0x7E => (7, false),
-
-    /// STA (STore Accumulator)
-    /// Affects Flags: None
-    StaIndirectX   (u8) = 0x81 => (6, false),
-    StaZeroPage    (u8) = 0x85 => (3, false),
-    StaAbsolute    (u16) = 0x8D => (4, false),
-    StaIndirectY   (u8) = 0x91 => (6, false),
-    StaZeroPageX   (u8) = 0x95 => (4, false),
-    StaAbsoluteY   (u16) = 0x99 => (5, false),
-    StaAbsoluteX   (u16) = 0x9D => (5, false),
-
-    /// STX (STore X register)
-    /// Affects Flags: None
-    StxZeroPage    (u8) = 0x86 => (3, false),
-    StxZeroPageY   (u8) = 0x96 => (4, false),
-    StxAbsolute    (u16) = 0x8E => (4, false),
-
-    /// STY (STore Y register)
-    /// Affects Flags: None
-    StyZeroPage    (u8) = 0x84 => (3, false),
-    StyZeroPageX   (u8) = 0x94 => (4, false),
-    StyAbsolute    (u16) = 0x8C => (4, false),
-
-    /// Register Instructions
-    /// Affect Flags: N Z
-    ///
-    /// These instructions are implied mode, have a length of one Byte and
-    /// require two machine cycles.
-    DeyImplied     = 0x88 => (2, false),  // DEcrement Y
-    TayImplied     = 0xA8 => (2, false),  // Transfer A to Y
-    TxaImplied     = 0x8A => (2, false),  // Transfer X to A
-    TaxImplied     = 0xAA => (2, false),  // Transfer A to X
-
-    /// BCC/BCS — Branch on Carry Clear / Set
-    BccRelative    (u8) = 0x90 => (2, true),
-    BcsRelative    (u8) = 0xB0 => (2, true),
-
-    /// TYA (Transfer Y to A)
-    TyaImplied     = 0x98 => (2, false),
-
-    /// Stack Instructions
-    ///
-    /// These instructions are implied mode, have a length of one Byte.
-    /// With the 6502, the stack is always on page one ($100-$1FF) and works
-    /// top down.
-    TxsImplied     = 0x9A => (2, false),  // Transfer X to Stack ptr
-    TsxImplied     = 0xBA => (2, false),  // Transfer Stack ptr to X
-
-    /// LDA (LoaD Accumulator)
-    /// Affects Flags: N Z
-    LdaIndirectX   (u8) = 0xA1 => (6, false),
-    LdaZeroPage    (u8) = 0xA5 => (3, false),
-    LdaImmediate   (u8) = 0xA9 => (2, false),
-    LdaAbsolute    (u16) = 0xAD => (4, false),
-    LdaIndirectY   (u8) = 0xB1 => (5, true),
-    LdaZeroPageX   (u8) = 0xB5 => (4, false),
-    LdaAbsoluteY   (u16) = 0xB9 => (4, true),
-    LdaAbsoluteX   (u16) = 0xBD => (4, true),
-
-    /// LDX (LoaD X register)
-    /// Affects Flags: N Z
-    LdxImmediate   (u8) = 0xA2 => (2, false),
-    LdxZeroPage    (u8) = 0xA6 => (3, false),
-    LdxAbsolute    (u16) = 0xAE => (4, false),
-    LdxZeroPageY   (u8) = 0xB6 => (4, false),
-    LdxAbsoluteY   (u16) = 0xBE => (4, true),
-
-    /// LDY (LoaD Y register)
-    /// Affects Flags: N Z
-    LdyImmediate   (u8) = 0xA0 => (2, false),
-    LdyZeroPage    (u8) = 0xA4 => (3, false),
-    LdyAbsolute    (u16) = 0xAC => (4, false),
-    LdyZeroPageX   (u8) = 0xB4 => (4, false),
-    LdyAbsoluteX   (u16) = 0xBC => (4, true),
-
-    /// CLV (CLear oVerflow)
-    ClvImplied     = 0xB8 => (2, false),
-
-    /// CPY (ComPare Y register)
-    /// Affects Flags: N Z C
-    ///
-    /// Operation and flag results are identical to equivalent mode CMP ops.
-    CpyImmediate   (u8) = 0xC0 => (2, false),
-    CpyZeroPage    (u8) = 0xC4 => (3, false),
-    CpyAbsolute    (u16) = 0xCC => (4, false),
-
-    /// CMP (CoMPare accumulator)
-    /// Affects Flags: N Z C
-    ///
-    /// Compare sets flags as if a subtraction had been carried out. If the value
-    /// in the accumulator is equal or greater than the compared value, the Carry
-    /// will be set. The equal (Z) and negative (N) flags will be set based on
-    /// equality or lack thereof and the sign (i.e. A>=0x80) of the accumulator.
-    CmpIndirectX   (u8) = 0xC1 => (6, false),
-    CmpZeroPage    (u8) = 0xC5 => (3, false),
-    CmpImmediate   (u8) = 0xC9 => (2, false),
-    CmpAbsolute    (u16) = 0xCD => (4, false),
-    CmpIndirectY   (u8) = 0xD1 => (5, true),
-    CmpZeroPageX   (u8) = 0xD5 => (4, false),
-    CmpAbsoluteY   (u16) = 0xD9 => (4, true),
-    CmpAbsoluteX   (u16) = 0xDD => (4, true),
-
-    /// DEC (DECrement memory)
-    /// Affects Flags: N Z
-    DecZeroPage    (u8) = 0xC6 => (5, false),
-    DecAbsolute    (u16) = 0xCE => (6, false),
-    DecZeroPageX   (u8) = 0xD6 => (6, false),
-    DecAbsoluteX   (u16) = 0xDE => (7, false),
-
-    /// INY (INcrement Y) / INX (INcrement X)
-    InyImplied     = 0xC8 => (2, false),
-    InxImplied     = 0xE8 => (2, false),
-
-    /// DEX (DEcrement X)
-    DexImplied     = 0xCA => (2, false),
-
-    /// BNE/BEQ — Branch on Not Equal / EQual
-    BneRelative    (u8) = 0xD0 => (2, true),
-    BeqRelative    (u8) = 0xF0 => (2, true),
-
-    /// CLD (CLear Decimal) / SED (SEt Decimal)
-    CldImplied     = 0xD8 => (2, false),
-    SedImplied     = 0xF8 => (2, false),
-
-    /// CPX (ComPare X register)
-    /// Affects Flags: N Z C
-    ///
-    /// Operation and flag results are identical to equivalent mode CMP ops.
-    CpxImmediate   (u8) = 0xE0 => (2, false),
-    CpxZeroPage    (u8) = 0xE4 => (3, false),
-    CpxAbsolute    (u16) = 0xEC => (4, false),
-
-    /// SBC (SuBtract with Carry)
-    /// Affects Flags: N V Z C
-    ///
-    /// SBC results are dependant on the setting of the decimal flag. In decimal
-    /// mode, subtraction is carried out on the assumption that the values
-    /// involved are packed BCD (Binary Coded Decimal).
-    /// There is no way to subtract without the carry which works as an inverse
-    /// borrow. i.e, to subtract you set the carry before the operation. If the
-    /// carry is cleared by the operation, it indicates a borrow occurred.
-    SbcIndirectX   (u8) = 0xE1 => (6, false),
-    SbcZeroPage    (u8) = 0xE5 => (3, false),
-    SbcImmediate   (u8) = 0xE9 => (2, false),
-    SbcAbsolute    (u16) = 0xED => (4, false),
-    SbcIndirectY   (u8) = 0xF1 => (5, true),
-    SbcZeroPageX   (u8) = 0xF5 => (4, false),
-    SbcAbsoluteY   (u16) = 0xF9 => (4, true),
-    SbcAbsoluteX   (u16) = 0xFD => (4, true),
-
-    /// INC (INCrement memory)
-    /// Affects Flags: N Z
-    IncZeroPage    (u8) = 0xE6 => (5, false),
-    IncAbsolute    (u16) = 0xEE => (6, false),
-    IncZeroPageX   (u8) = 0xF6 => (6, false),
-    IncAbsoluteX   (u16) = 0xFE => (7, false),
-
-    /// NOP (No OPeration)
-    /// Affects Flags: None
-    NopImplied     = 0xEA => (2, false),
+impl Default for FlatMemory {
+    fn default() -> Self { Self { ram: [0; 0x10000] } }
 }
 
-/// 6502 CPU state.
+impl FlatMemory {
+    pub fn new() -> Self { Self::default() }
+
+    /// Load a binary blob at the given base address.
+    pub fn load(&mut self, base: u16, data: &[u8]) {
+        let start = base as usize;
+        self.ram[start..start + data.len()].copy_from_slice(data);
+    }
+}
+
+impl Memory for FlatMemory {
+    fn read(&mut self, addr: u16) -> u8 { self.ram[addr as usize] }
+    fn write(&mut self, addr: u16, val: u8) { self.ram[addr as usize] = val; }
+}
+
+// ---------------------------------------------------------------------------
+// CPU
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug)]
 pub struct Cpu {
-    /// Accumulator
-    pub a: u8,
-    /// X index register
-    pub x: u8,
-    /// Y index register
-    pub y: u8,
-    /// Stack pointer
-    pub sp: u8,
-    /// Program counter
     pub pc: u16,
-    /// Processor status flags
+    pub sp: u8,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
     pub status: Status,
-    /// Total cycles executed
     pub cycles: u64,
 }
 
 impl Default for Cpu {
     fn default() -> Self {
         Self {
+            pc: 0,
+            sp: 0xFD,
             a: 0,
             x: 0,
             y: 0,
-            sp: 0xFD,
-            pc: 0,
             status: Status::default(),
             cycles: 0,
         }
@@ -495,11 +119,9 @@ impl Default for Cpu {
 }
 
 impl Cpu {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    /// Reset the CPU, reading the reset vector from memory.
+    /// Reset the CPU, reading the reset vector from $FFFC/$FFFD.
     pub fn reset<M: Memory>(&mut self, memory: &mut M) {
         let lo = memory.read(0xFFFC) as u16;
         let hi = memory.read(0xFFFD) as u16;
@@ -511,620 +133,1015 @@ impl Cpu {
         self.y = 0;
     }
 
-    /// Resolve the effective address for memory-addressing modes.
-    /// Returns None for immediate, implied, accumulator, and relative modes.
-    fn resolve_addr<M: Memory>(&self, op: &OpCode, memory: &mut M) -> Option<u16> {
-        match *op {
-            // Immediate — no address, value is the operand itself
-            OpCode::AdcImmediate(_) | OpCode::AndImmediate(_) | OpCode::CmpImmediate(_) |
-            OpCode::CpxImmediate(_) | OpCode::CpyImmediate(_) | OpCode::EorImmediate(_) |
-            OpCode::LdaImmediate(_) | OpCode::LdxImmediate(_) | OpCode::LdyImmediate(_) |
-            OpCode::OraImmediate(_) | OpCode::SbcImmediate(_) => None,
+    // -- helpers for stack operations --
 
-            // Zero Page — operand is an 8-bit address in page zero
-            OpCode::AdcZeroPage(zp)  | OpCode::AndZeroPage(zp)  | OpCode::AslZeroPage(zp)  |
-            OpCode::BitZeroPage(zp)  | OpCode::CmpZeroPage(zp)  | OpCode::CpxZeroPage(zp)  |
-            OpCode::CpyZeroPage(zp)  | OpCode::DecZeroPage(zp)  | OpCode::EorZeroPage(zp)  |
-            OpCode::IncZeroPage(zp)  | OpCode::LdaZeroPage(zp)  | OpCode::LdxZeroPage(zp)  |
-            OpCode::LdyZeroPage(zp)  | OpCode::LsrZeroPage(zp)  | OpCode::OraZeroPage(zp)  |
-            OpCode::RolZeroPage(zp)  | OpCode::RorZeroPage(zp)  | OpCode::SbcZeroPage(zp)  |
-            OpCode::StaZeroPage(zp)  | OpCode::StxZeroPage(zp)  | OpCode::StyZeroPage(zp)  =>
-                Some(zp as u16),
+    #[inline]
+    fn push<M: Memory>(&mut self, mem: &mut M, val: u8) {
+        mem.write(0x0100 | self.sp as u16, val);
+        self.sp = self.sp.wrapping_sub(1);
+    }
 
-            // Zero Page,X — (operand + X) wrapped to page zero
-            OpCode::AdcZeroPageX(zp) | OpCode::AndZeroPageX(zp) | OpCode::AslZeroPageX(zp) |
-            OpCode::CmpZeroPageX(zp) | OpCode::DecZeroPageX(zp) | OpCode::EorZeroPageX(zp) |
-            OpCode::IncZeroPageX(zp) | OpCode::LdaZeroPageX(zp) | OpCode::LdyZeroPageX(zp) |
-            OpCode::LsrZeroPageX(zp) | OpCode::OraZeroPageX(zp) | OpCode::RolZeroPageX(zp) |
-            OpCode::RorZeroPageX(zp) | OpCode::SbcZeroPageX(zp) | OpCode::StaZeroPageX(zp) |
-            OpCode::StyZeroPageX(zp) =>
-                Some(zp.wrapping_add(self.x) as u16),
+    #[inline]
+    fn pull<M: Memory>(&mut self, mem: &mut M) -> u8 {
+        self.sp = self.sp.wrapping_add(1);
+        mem.read(0x0100 | self.sp as u16)
+    }
 
-            // Zero Page,Y — (operand + Y) wrapped to page zero
-            OpCode::LdxZeroPageY(zp) | OpCode::StxZeroPageY(zp) =>
-                Some(zp.wrapping_add(self.y) as u16),
+    // -- ALU helpers --
 
-            // Absolute — operand is the full 16-bit address
-            OpCode::AdcAbsolute(addr)  | OpCode::AndAbsolute(addr)  | OpCode::AslAbsolute(addr)  |
-            OpCode::BitAbsolute(addr)  | OpCode::CmpAbsolute(addr)  | OpCode::CpxAbsolute(addr)  |
-            OpCode::CpyAbsolute(addr)  | OpCode::DecAbsolute(addr)  | OpCode::EorAbsolute(addr)  |
-            OpCode::IncAbsolute(addr)  | OpCode::JmpAbsolute(addr)  | OpCode::JsrAbsolute(addr)  |
-            OpCode::LdaAbsolute(addr)  | OpCode::LdxAbsolute(addr)  | OpCode::LdyAbsolute(addr)  |
-            OpCode::LsrAbsolute(addr)  | OpCode::OraAbsolute(addr)  | OpCode::RolAbsolute(addr)  |
-            OpCode::RorAbsolute(addr)  | OpCode::SbcAbsolute(addr)  | OpCode::StaAbsolute(addr)  |
-            OpCode::StxAbsolute(addr)  | OpCode::StyAbsolute(addr)  =>
-                Some(addr),
-
-            // Absolute,X — operand + X
-            OpCode::AdcAbsoluteX(addr) | OpCode::AndAbsoluteX(addr) | OpCode::AslAbsoluteX(addr) |
-            OpCode::CmpAbsoluteX(addr) | OpCode::DecAbsoluteX(addr) | OpCode::EorAbsoluteX(addr) |
-            OpCode::IncAbsoluteX(addr) | OpCode::LdaAbsoluteX(addr) | OpCode::LdyAbsoluteX(addr) |
-            OpCode::LsrAbsoluteX(addr) | OpCode::OraAbsoluteX(addr) | OpCode::RolAbsoluteX(addr) |
-            OpCode::RorAbsoluteX(addr) | OpCode::SbcAbsoluteX(addr) | OpCode::StaAbsoluteX(addr) =>
-                Some(addr.wrapping_add(self.x as u16)),
-
-            // Absolute,Y — operand + Y
-            OpCode::AdcAbsoluteY(addr) | OpCode::AndAbsoluteY(addr) | OpCode::CmpAbsoluteY(addr) |
-            OpCode::EorAbsoluteY(addr) | OpCode::LdaAbsoluteY(addr) | OpCode::LdxAbsoluteY(addr) |
-            OpCode::OraAbsoluteY(addr) | OpCode::SbcAbsoluteY(addr) | OpCode::StaAbsoluteY(addr) =>
-                Some(addr.wrapping_add(self.y as u16)),
-
-            // Indirect,X — read 16-bit address from zero page at (operand + X)
-            OpCode::AdcIndirectX(zp) | OpCode::AndIndirectX(zp) | OpCode::CmpIndirectX(zp) |
-            OpCode::EorIndirectX(zp) | OpCode::LdaIndirectX(zp) | OpCode::OraIndirectX(zp) |
-            OpCode::SbcIndirectX(zp) | OpCode::StaIndirectX(zp) => {
-                let ptr = zp.wrapping_add(self.x);
-                let lo = memory.read(ptr as u16) as u16;
-                let hi = memory.read(ptr.wrapping_add(1) as u16) as u16;
-                Some((hi << 8) | lo)
-            }
-
-            // Indirect,Y — read 16-bit address from zero page at operand, then add Y
-            OpCode::AdcIndirectY(zp) | OpCode::AndIndirectY(zp) | OpCode::CmpIndirectY(zp) |
-            OpCode::EorIndirectY(zp) | OpCode::LdaIndirectY(zp) | OpCode::OraIndirectY(zp) |
-            OpCode::SbcIndirectY(zp) | OpCode::StaIndirectY(zp) => {
-                let lo = memory.read(zp as u16) as u16;
-                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
-                Some(((hi << 8) | lo).wrapping_add(self.y as u16))
-            }
-
-            // JMP Indirect — read 16-bit address from the operand address
-            // (with the 6502 page-boundary bug)
-            OpCode::JmpIndirect(addr) => {
-                let lo = memory.read(addr) as u16;
-                // Bug: if addr is $xxFF, high byte wraps within the page
-                let hi_addr = (addr & 0xFF00) | ((addr.wrapping_add(1)) & 0x00FF);
-                let hi = memory.read(hi_addr) as u16;
-                Some((hi << 8) | lo)
-            }
-
-            // All other opcodes (implied, accumulator, relative) have no effective address
-            _ => None,
+    #[inline]
+    fn adc(&mut self, val: u8) {
+        let carry = self.status.get(CARRY) as u8;
+        if self.status.get(DECIMAL) {
+            let mut lo = (self.a & 0x0F) + (val & 0x0F) + carry;
+            if lo > 9 { lo += 6; }
+            let mut hi = (self.a >> 4) + (val >> 4) + if lo > 0x0F { 1 } else { 0 };
+            let bin_sum = (self.a as u16) + (val as u16) + (carry as u16);
+            self.status.set(ZERO, (bin_sum as u8) == 0);
+            self.status.set(NEGATIVE, (hi & 0x08) != 0);
+            self.status.set(OVERFLOW,
+                (!(self.a ^ val) & (self.a ^ ((hi << 4) | (lo & 0x0F))) & 0x80) != 0);
+            if hi > 9 { hi += 6; }
+            self.status.set(CARRY, hi > 0x0F);
+            self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
+        } else {
+            let (sum1, c1) = self.a.overflowing_add(val);
+            let (sum2, c2) = sum1.overflowing_add(carry);
+            self.status.set(CARRY, c1 || c2);
+            self.status.set(OVERFLOW, (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0);
+            self.a = sum2;
+            self.status.set_zn(self.a);
         }
     }
 
-    /// Returns 1 if the addressing mode crossed a page boundary, 0 otherwise.
-    /// Only relevant for AbsoluteX, AbsoluteY, and IndirectY modes.
-    fn page_cross_penalty<M: Memory>(&self, op: &OpCode, memory: &mut M) -> u8 {
-        match *op {
-            // Absolute,X — page cross if base and base+X differ in high byte
-            OpCode::AdcAbsoluteX(addr) | OpCode::AndAbsoluteX(addr) | OpCode::CmpAbsoluteX(addr) |
-            OpCode::EorAbsoluteX(addr) | OpCode::LdaAbsoluteX(addr) | OpCode::LdyAbsoluteX(addr) |
-            OpCode::OraAbsoluteX(addr) | OpCode::SbcAbsoluteX(addr) => {
-                if (addr & 0xFF00) != (addr.wrapping_add(self.x as u16) & 0xFF00) { 1 } else { 0 }
-            }
-            // Absolute,Y
-            OpCode::AdcAbsoluteY(addr) | OpCode::AndAbsoluteY(addr) | OpCode::CmpAbsoluteY(addr) |
-            OpCode::EorAbsoluteY(addr) | OpCode::LdaAbsoluteY(addr) | OpCode::LdxAbsoluteY(addr) |
-            OpCode::OraAbsoluteY(addr) | OpCode::SbcAbsoluteY(addr) => {
-                if (addr & 0xFF00) != (addr.wrapping_add(self.y as u16) & 0xFF00) { 1 } else { 0 }
-            }
-            // Indirect,Y — page cross if base pointer value and value+Y differ in high byte
-            OpCode::AdcIndirectY(zp) | OpCode::AndIndirectY(zp) | OpCode::CmpIndirectY(zp) |
-            OpCode::EorIndirectY(zp) | OpCode::LdaIndirectY(zp) | OpCode::OraIndirectY(zp) |
-            OpCode::SbcIndirectY(zp) => {
-                let lo = memory.read(zp as u16) as u16;
-                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
-                let base = (hi << 8) | lo;
-                if (base & 0xFF00) != (base.wrapping_add(self.y as u16) & 0xFF00) { 1 } else { 0 }
-            }
-            _ => 0,
+    #[inline]
+    fn sbc(&mut self, val: u8) {
+        let borrow = !self.status.get(CARRY) as u8;
+        if self.status.get(DECIMAL) {
+            let mut lo = (self.a & 0x0F).wrapping_sub(val & 0x0F).wrapping_sub(borrow);
+            let lo_borrow = if (lo as i8) < 0 { lo = lo.wrapping_sub(6); 1u8 } else { 0 };
+            let mut hi = (self.a >> 4).wrapping_sub(val >> 4).wrapping_sub(lo_borrow);
+            if (hi as i8) < 0 { hi = hi.wrapping_sub(6); }
+            let bin_diff = (self.a as i16) - (val as i16) - (borrow as i16);
+            self.status.set(CARRY, bin_diff >= 0);
+            self.status.set(ZERO, (bin_diff as u8) == 0);
+            self.status.set(NEGATIVE, (bin_diff as u8) & 0x80 != 0);
+            self.status.set(OVERFLOW,
+                ((self.a ^ val) & (self.a ^ (bin_diff as u8)) & 0x80) != 0);
+            self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
+        } else {
+            let (diff1, b1) = self.a.overflowing_sub(val);
+            let (diff2, b2) = diff1.overflowing_sub(borrow);
+            self.status.set(CARRY, !(b1 || b2));
+            self.status.set(OVERFLOW, ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0);
+            self.a = diff2;
+            self.status.set_zn(self.a);
         }
     }
 
-    /// Resolve the operand to a value: for immediate mode returns the operand
-    /// directly, for memory-addressing modes reads the byte at the effective address.
-    fn resolve<M: Memory>(&self, op: &OpCode, memory: &mut M) -> u8 {
-        match *op {
-            // Immediate — the operand IS the value
-            OpCode::AdcImmediate(v) | OpCode::AndImmediate(v) | OpCode::CmpImmediate(v) |
-            OpCode::CpxImmediate(v) | OpCode::CpyImmediate(v) | OpCode::EorImmediate(v) |
-            OpCode::LdaImmediate(v) | OpCode::LdxImmediate(v) | OpCode::LdyImmediate(v) |
-            OpCode::OraImmediate(v) | OpCode::SbcImmediate(v) => v,
-
-            // Everything else — read from the effective address
-            _ => {
-                let addr = self.resolve_addr(op, memory)
-                    .expect("resolve called on opcode with no effective address");
-                memory.read(addr)
-            }
-        }
+    #[inline]
+    fn compare(&mut self, reg: u8, val: u8) {
+        let result = reg.wrapping_sub(val);
+        self.status.set(CARRY, reg >= val);
+        self.status.set_zn(result);
     }
 
-    /// Execute a single instruction. Returns the number of cycles consumed.
+    #[inline]
+    fn asl_val(&mut self, val: u8) -> u8 {
+        self.status.set(CARRY, val & 0x80 != 0);
+        let r = val << 1;
+        self.status.set_zn(r);
+        r
+    }
+
+    #[inline]
+    fn lsr_val(&mut self, val: u8) -> u8 {
+        self.status.set(CARRY, val & 0x01 != 0);
+        let r = val >> 1;
+        self.status.set_zn(r);
+        r
+    }
+
+    #[inline]
+    fn rol_val(&mut self, val: u8) -> u8 {
+        let old_carry = self.status.get(CARRY) as u8;
+        self.status.set(CARRY, val & 0x80 != 0);
+        let r = (val << 1) | old_carry;
+        self.status.set_zn(r);
+        r
+    }
+
+    #[inline]
+    fn ror_val(&mut self, val: u8) -> u8 {
+        let old_carry = self.status.get(CARRY) as u8;
+        self.status.set(CARRY, val & 0x01 != 0);
+        let r = (val >> 1) | (old_carry << 7);
+        self.status.set_zn(r);
+        r
+    }
+
+    /// Execute a single instruction with cycle-accurate bus accesses.
+    /// Returns the number of cycles consumed.
     pub fn step<M: Memory>(&mut self, memory: &mut M) -> u8 {
-        let op = OpCode::decode(memory, self.pc)
-            .unwrap_or_else(|| panic!("illegal opcode: 0x{:02X} at PC=0x{:04X}", memory.read(self.pc), self.pc));
-        let details = op.details();
+        let mut cycles: u8 = 0;
 
-        match op {
-            // ADC — Add with Carry
-            OpCode::AdcImmediate(_) | OpCode::AdcZeroPage(_) | OpCode::AdcZeroPageX(_) |
-            OpCode::AdcAbsolute(_)  | OpCode::AdcAbsoluteX(_) | OpCode::AdcAbsoluteY(_) |
-            OpCode::AdcIndirectX(_) | OpCode::AdcIndirectY(_) => {
-                let val = self.resolve(&op, memory);
-                let carry = self.status.get(CARRY) as u8;
+        // Cycle 1: fetch opcode
+        let opcode = memory.read(self.pc);
+        self.pc = self.pc.wrapping_add(1);
+        cycles += 1;
 
-                if self.status.get(DECIMAL) {
-                    // BCD mode
-                    let mut lo = (self.a & 0x0F) + (val & 0x0F) + carry;
-                    if lo > 9 { lo += 6; }
-                    let mut hi = (self.a >> 4) + (val >> 4) + if lo > 0x0F { 1 } else { 0 };
+        match opcode {
+            // ==================================================================
+            // NOP (implied, 2 cycles)
+            // ==================================================================
+            0xEA => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+            }
 
-                    // Overflow is computed from the binary-like intermediate
-                    let bin_sum = (self.a as u16) + (val as u16) + (carry as u16);
-                    self.status.set(ZERO, (bin_sum as u8) == 0);
-                    self.status.set(NEGATIVE, (hi & 0x08) != 0);
-                    self.status.set(OVERFLOW,
-                        (!(self.a ^ val) & (self.a ^ ((hi << 4) | (lo & 0x0F))) & 0x80) != 0);
-
-                    if hi > 9 { hi += 6; }
-                    self.status.set(CARRY, hi > 0x0F);
-                    self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
-                } else {
-                    let (sum1, c1) = self.a.overflowing_add(val);
-                    let (sum2, c2) = sum1.overflowing_add(carry);
-                    self.status.set(CARRY, c1 || c2);
-                    self.status.set(OVERFLOW, (!(self.a ^ val) & (self.a ^ sum2) & 0x80) != 0);
-                    self.a = sum2;
-                    self.status.set_zn(self.a);
+            // ==================================================================
+            // Flag instructions (implied, 2 cycles)
+            // ==================================================================
+            0x18 | 0x38 | 0x58 | 0x78 | 0xB8 | 0xD8 | 0xF8 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                match opcode {
+                    0x18 => self.status.set(CARRY, false),     // CLC
+                    0x38 => self.status.set(CARRY, true),      // SEC
+                    0x58 => self.status.set(INTERRUPT, false),  // CLI
+                    0x78 => self.status.set(INTERRUPT, true),   // SEI
+                    0xB8 => self.status.set(OVERFLOW, false),   // CLV
+                    0xD8 => self.status.set(DECIMAL, false),    // CLD
+                    0xF8 => self.status.set(DECIMAL, true),     // SED
+                    _ => unreachable!(),
                 }
             }
 
-            // SBC — Subtract with Carry (borrow)
-            OpCode::SbcImmediate(_) | OpCode::SbcZeroPage(_) | OpCode::SbcZeroPageX(_) |
-            OpCode::SbcAbsolute(_)  | OpCode::SbcAbsoluteX(_) | OpCode::SbcAbsoluteY(_) |
-            OpCode::SbcIndirectX(_) | OpCode::SbcIndirectY(_) => {
-                let val = self.resolve(&op, memory);
-                let borrow = !self.status.get(CARRY) as u8;
-
-                if self.status.get(DECIMAL) {
-                    // BCD mode
-                    let mut lo = (self.a & 0x0F).wrapping_sub(val & 0x0F).wrapping_sub(borrow);
-                    let lo_borrow = if (lo as i8) < 0 { lo = lo.wrapping_sub(6); 1u8 } else { 0 };
-                    let mut hi = (self.a >> 4).wrapping_sub(val >> 4).wrapping_sub(lo_borrow);
-                    if (hi as i8) < 0 { hi = hi.wrapping_sub(6); }
-
-                    let bin_diff = (self.a as i16) - (val as i16) - (borrow as i16);
-                    self.status.set(CARRY, bin_diff >= 0);
-                    self.status.set(ZERO, (bin_diff as u8) == 0);
-                    self.status.set(NEGATIVE, (bin_diff as u8) & 0x80 != 0);
-                    self.status.set(OVERFLOW,
-                        ((self.a ^ val) & (self.a ^ (bin_diff as u8)) & 0x80) != 0);
-                    self.a = ((hi & 0x0F) << 4) | (lo & 0x0F);
-                } else {
-                    let (diff1, b1) = self.a.overflowing_sub(val);
-                    let (diff2, b2) = diff1.overflowing_sub(borrow);
-                    self.status.set(CARRY, !(b1 || b2));
-                    self.status.set(OVERFLOW, ((self.a ^ val) & (self.a ^ diff2) & 0x80) != 0);
-                    self.a = diff2;
-                    self.status.set_zn(self.a);
+            // ==================================================================
+            // Register transfers (implied, 2 cycles)
+            // ==================================================================
+            0xAA | 0xA8 | 0x8A | 0x98 | 0xBA | 0x9A => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                match opcode {
+                    0xAA => { self.x = self.a; self.status.set_zn(self.x); }        // TAX
+                    0xA8 => { self.y = self.a; self.status.set_zn(self.y); }        // TAY
+                    0x8A => { self.a = self.x; self.status.set_zn(self.a); }        // TXA
+                    0x98 => { self.a = self.y; self.status.set_zn(self.a); }        // TYA
+                    0xBA => { self.x = self.sp; self.status.set_zn(self.x); }       // TSX
+                    0x9A => { self.sp = self.x; }                                    // TXS
+                    _ => unreachable!(),
                 }
             }
 
-            // AND — Bitwise AND
-            OpCode::AndImmediate(_) | OpCode::AndZeroPage(_) | OpCode::AndZeroPageX(_) |
-            OpCode::AndAbsolute(_)  | OpCode::AndAbsoluteX(_) | OpCode::AndAbsoluteY(_) |
-            OpCode::AndIndirectX(_) | OpCode::AndIndirectY(_) => {
-                self.a &= self.resolve(&op, memory);
-                self.status.set_zn(self.a);
+            // ==================================================================
+            // INX/INY/DEX/DEY (implied, 2 cycles)
+            // ==================================================================
+            0xE8 | 0xC8 | 0xCA | 0x88 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                match opcode {
+                    0xE8 => { self.x = self.x.wrapping_add(1); self.status.set_zn(self.x); } // INX
+                    0xC8 => { self.y = self.y.wrapping_add(1); self.status.set_zn(self.y); } // INY
+                    0xCA => { self.x = self.x.wrapping_sub(1); self.status.set_zn(self.x); } // DEX
+                    0x88 => { self.y = self.y.wrapping_sub(1); self.status.set_zn(self.y); } // DEY
+                    _ => unreachable!(),
+                }
             }
 
-            // ORA — Bitwise OR
-            OpCode::OraImmediate(_) | OpCode::OraZeroPage(_) | OpCode::OraZeroPageX(_) |
-            OpCode::OraAbsolute(_)  | OpCode::OraAbsoluteX(_) | OpCode::OraAbsoluteY(_) |
-            OpCode::OraIndirectX(_) | OpCode::OraIndirectY(_) => {
-                self.a |= self.resolve(&op, memory);
-                self.status.set_zn(self.a);
+            // ==================================================================
+            // ASL/LSR/ROL/ROR accumulator (implied, 2 cycles)
+            // ==================================================================
+            0x0A | 0x4A | 0x2A | 0x6A => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                match opcode {
+                    0x0A => { self.a = self.asl_val(self.a); }
+                    0x4A => { self.a = self.lsr_val(self.a); }
+                    0x2A => { self.a = self.rol_val(self.a); }
+                    0x6A => { self.a = self.ror_val(self.a); }
+                    _ => unreachable!(),
+                }
             }
 
-            // EOR — Bitwise Exclusive OR
-            OpCode::EorImmediate(_) | OpCode::EorZeroPage(_) | OpCode::EorZeroPageX(_) |
-            OpCode::EorAbsolute(_)  | OpCode::EorAbsoluteX(_) | OpCode::EorAbsoluteY(_) |
-            OpCode::EorIndirectX(_) | OpCode::EorIndirectY(_) => {
-                self.a ^= self.resolve(&op, memory);
-                self.status.set_zn(self.a);
+            // ==================================================================
+            // Immediate mode (2 cycles): ADC, AND, CMP, CPX, CPY, EOR, LDA,
+            //   LDX, LDY, ORA, SBC
+            // ==================================================================
+            0x69 | 0x29 | 0xC9 | 0xE0 | 0xC0 | 0x49 | 0xA9 |
+            0xA2 | 0xA0 | 0x09 | 0xE9 => {
+                // Cycle 2: fetch operand
+                let val = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                match opcode {
+                    0x69 => self.adc(val),
+                    0xE9 => self.sbc(val),
+                    0x29 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x09 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x49 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xC9 => self.compare(self.a, val),
+                    0xE0 => self.compare(self.x, val),
+                    0xC0 => self.compare(self.y, val),
+                    0xA9 => { self.a = val; self.status.set_zn(self.a); }
+                    0xA2 => { self.x = val; self.status.set_zn(self.x); }
+                    0xA0 => { self.y = val; self.status.set_zn(self.y); }
+                    _ => unreachable!(),
+                }
             }
 
-            // CMP — Compare accumulator
-            OpCode::CmpImmediate(_) | OpCode::CmpZeroPage(_) | OpCode::CmpZeroPageX(_) |
-            OpCode::CmpAbsolute(_)  | OpCode::CmpAbsoluteX(_) | OpCode::CmpAbsoluteY(_) |
-            OpCode::CmpIndirectX(_) | OpCode::CmpIndirectY(_) => {
-                let val = self.resolve(&op, memory);
-                let result = self.a.wrapping_sub(val);
-                self.status.set(CARRY, self.a >= val);
-                self.status.set_zn(result);
+            // ==================================================================
+            // Zero Page read (3 cycles): LDA, LDX, LDY, ADC, AND, CMP, CPX,
+            //   CPY, EOR, ORA, SBC, BIT
+            // ==================================================================
+            0xA5 | 0xA6 | 0xA4 | 0x65 | 0x25 | 0xC5 | 0xE4 |
+            0xC4 | 0x45 | 0x05 | 0xE5 | 0x24 => {
+                // Cycle 2: fetch ZP address
+                let addr = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: read from ZP
+                let val = memory.read(addr);
+                cycles += 1;
+                match opcode {
+                    0xA5 => { self.a = val; self.status.set_zn(self.a); }
+                    0xA6 => { self.x = val; self.status.set_zn(self.x); }
+                    0xA4 => { self.y = val; self.status.set_zn(self.y); }
+                    0x65 => self.adc(val),
+                    0xE5 => self.sbc(val),
+                    0x25 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x05 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x45 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xC5 => self.compare(self.a, val),
+                    0xE4 => self.compare(self.x, val),
+                    0xC4 => self.compare(self.y, val),
+                    0x24 => {
+                        // BIT
+                        self.status.set(ZERO, (self.a & val) == 0);
+                        self.status.set(OVERFLOW, val & 0x40 != 0);
+                        self.status.set(NEGATIVE, val & 0x80 != 0);
+                    }
+                    _ => unreachable!(),
+                }
             }
 
-            // CPX — Compare X register
-            OpCode::CpxImmediate(_) | OpCode::CpxZeroPage(_) | OpCode::CpxAbsolute(_) => {
-                let val = self.resolve(&op, memory);
-                let result = self.x.wrapping_sub(val);
-                self.status.set(CARRY, self.x >= val);
-                self.status.set_zn(result);
-            }
-
-            // CPY — Compare Y register
-            OpCode::CpyImmediate(_) | OpCode::CpyZeroPage(_) | OpCode::CpyAbsolute(_) => {
-                let val = self.resolve(&op, memory);
-                let result = self.y.wrapping_sub(val);
-                self.status.set(CARRY, self.y >= val);
-                self.status.set_zn(result);
-            }
-
-            // INC — Increment memory
-            OpCode::IncZeroPage(_) | OpCode::IncZeroPageX(_) |
-            OpCode::IncAbsolute(_) | OpCode::IncAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let val = memory.read(addr).wrapping_add(1);
-                memory.write(addr, val);
-                self.status.set_zn(val);
-            }
-
-            // DEC — Decrement memory
-            OpCode::DecZeroPage(_) | OpCode::DecZeroPageX(_) |
-            OpCode::DecAbsolute(_) | OpCode::DecAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let val = memory.read(addr).wrapping_sub(1);
-                memory.write(addr, val);
-                self.status.set_zn(val);
-            }
-
-            // INX / INY / DEX / DEY — Register increment/decrement
-            OpCode::InxImplied => {
-                self.x = self.x.wrapping_add(1);
-                self.status.set_zn(self.x);
-            }
-            OpCode::InyImplied => {
-                self.y = self.y.wrapping_add(1);
-                self.status.set_zn(self.y);
-            }
-            OpCode::DexImplied => {
-                self.x = self.x.wrapping_sub(1);
-                self.status.set_zn(self.x);
-            }
-            OpCode::DeyImplied => {
-                self.y = self.y.wrapping_sub(1);
-                self.status.set_zn(self.y);
-            }
-
-            // ASL — Arithmetic Shift Left
-            OpCode::AslAccumulator => {
-                self.status.set(CARRY, self.a & 0x80 != 0);
-                self.a <<= 1;
-                self.status.set_zn(self.a);
-            }
-            OpCode::AslZeroPage(_) | OpCode::AslZeroPageX(_) |
-            OpCode::AslAbsolute(_) | OpCode::AslAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let mut val = memory.read(addr);
-                self.status.set(CARRY, val & 0x80 != 0);
-                val <<= 1;
-                memory.write(addr, val);
-                self.status.set_zn(val);
-            }
-
-            // LSR — Logical Shift Right
-            OpCode::LsrAccumulator => {
-                self.status.set(CARRY, self.a & 0x01 != 0);
-                self.a >>= 1;
-                self.status.set(ZERO, self.a == 0);
-                self.status.set(NEGATIVE, false);
-            }
-            OpCode::LsrZeroPage(_) | OpCode::LsrZeroPageX(_) |
-            OpCode::LsrAbsolute(_) | OpCode::LsrAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let mut val = memory.read(addr);
-                self.status.set(CARRY, val & 0x01 != 0);
-                val >>= 1;
-                memory.write(addr, val);
-                self.status.set(ZERO, val == 0);
-                self.status.set(NEGATIVE, false);
-            }
-
-            // ROL — Rotate Left
-            OpCode::RolAccumulator => {
-                let old_carry = self.status.get(CARRY) as u8;
-                self.status.set(CARRY, self.a & 0x80 != 0);
-                self.a = (self.a << 1) | old_carry;
-                self.status.set_zn(self.a);
-            }
-            OpCode::RolZeroPage(_) | OpCode::RolZeroPageX(_) |
-            OpCode::RolAbsolute(_) | OpCode::RolAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let mut val = memory.read(addr);
-                let old_carry = self.status.get(CARRY) as u8;
-                self.status.set(CARRY, val & 0x80 != 0);
-                val = (val << 1) | old_carry;
-                memory.write(addr, val);
-                self.status.set_zn(val);
-            }
-
-            // ROR — Rotate Right
-            OpCode::RorAccumulator => {
-                let old_carry = self.status.get(CARRY) as u8;
-                self.status.set(CARRY, self.a & 0x01 != 0);
-                self.a = (self.a >> 1) | (old_carry << 7);
-                self.status.set_zn(self.a);
-            }
-            OpCode::RorZeroPage(_) | OpCode::RorZeroPageX(_) |
-            OpCode::RorAbsolute(_) | OpCode::RorAbsoluteX(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                let mut val = memory.read(addr);
-                let old_carry = self.status.get(CARRY) as u8;
-                self.status.set(CARRY, val & 0x01 != 0);
-                val = (val >> 1) | (old_carry << 7);
-                memory.write(addr, val);
-                self.status.set_zn(val);
-            }
-
-            // BIT — Test bits
-            OpCode::BitZeroPage(_) | OpCode::BitAbsolute(_) => {
-                let val = self.resolve(&op, memory);
-                self.status.set(ZERO, (self.a & val) == 0);
-                self.status.set(OVERFLOW, val & 0x40 != 0);
-                self.status.set(NEGATIVE, val & 0x80 != 0);
-            }
-
-            // TAX — Transfer A to X
-            OpCode::TaxImplied => {
-                self.x = self.a;
-                self.status.set_zn(self.x);
-            }
-            // TXA — Transfer X to A
-            OpCode::TxaImplied => {
-                self.a = self.x;
-                self.status.set_zn(self.a);
-            }
-            // TAY — Transfer A to Y
-            OpCode::TayImplied => {
-                self.y = self.a;
-                self.status.set_zn(self.y);
-            }
-            // TYA — Transfer Y to A
-            OpCode::TyaImplied => {
-                self.a = self.y;
-                self.status.set_zn(self.a);
-            }
-
-            // LDA — Load Accumulator
-            OpCode::LdaImmediate(_) | OpCode::LdaZeroPage(_) | OpCode::LdaZeroPageX(_) |
-            OpCode::LdaAbsolute(_)  | OpCode::LdaAbsoluteX(_) | OpCode::LdaAbsoluteY(_) |
-            OpCode::LdaIndirectX(_) | OpCode::LdaIndirectY(_) => {
-                self.a = self.resolve(&op, memory);
-                self.status.set_zn(self.a);
-            }
-            // LDX — Load X register
-            OpCode::LdxImmediate(_) | OpCode::LdxZeroPage(_) | OpCode::LdxZeroPageY(_) |
-            OpCode::LdxAbsolute(_)  | OpCode::LdxAbsoluteY(_) => {
-                self.x = self.resolve(&op, memory);
-                self.status.set_zn(self.x);
-            }
-            // LDY — Load Y register
-            OpCode::LdyImmediate(_) | OpCode::LdyZeroPage(_) | OpCode::LdyZeroPageX(_) |
-            OpCode::LdyAbsolute(_)  | OpCode::LdyAbsoluteX(_) => {
-                self.y = self.resolve(&op, memory);
-                self.status.set_zn(self.y);
-            }
-
-            // STA — Store Accumulator
-            OpCode::StaZeroPage(_) | OpCode::StaZeroPageX(_) |
-            OpCode::StaAbsolute(_) | OpCode::StaAbsoluteX(_) | OpCode::StaAbsoluteY(_) |
-            OpCode::StaIndirectX(_) | OpCode::StaIndirectY(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                memory.write(addr, self.a);
-            }
-            // STX — Store X register
-            OpCode::StxZeroPage(_) | OpCode::StxZeroPageY(_) | OpCode::StxAbsolute(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                memory.write(addr, self.x);
-            }
-            // STY — Store Y register
-            OpCode::StyZeroPage(_) | OpCode::StyZeroPageX(_) | OpCode::StyAbsolute(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                memory.write(addr, self.y);
-            }
-
-            // TXS — Transfer X to Stack pointer (no flags affected)
-            OpCode::TxsImplied => {
-                self.sp = self.x;
-            }
-            // TSX — Transfer Stack pointer to X
-            OpCode::TsxImplied => {
-                self.x = self.sp;
-                self.status.set_zn(self.x);
-            }
-
-            // PHA — Push Accumulator
-            OpCode::PhaImplied => {
-                memory.write(0x0100 | self.sp as u16, self.a);
-                self.sp = self.sp.wrapping_sub(1);
-            }
-            // PLA — Pull Accumulator
-            OpCode::PlaImplied => {
-                self.sp = self.sp.wrapping_add(1);
-                self.a = memory.read(0x0100 | self.sp as u16);
-                self.status.set_zn(self.a);
-            }
-
-            // PHP — Push Processor status
-            OpCode::PhpImplied => {
-                // PHP always pushes with break and unused bits set
-                let flags = self.status.to_byte_with_break();
-                memory.write(0x0100 | self.sp as u16, flags);
-                self.sp = self.sp.wrapping_sub(1);
-            }
-            // PLP — Pull Processor status
-            OpCode::PlpImplied => {
-                self.sp = self.sp.wrapping_add(1);
-                let flags = memory.read(0x0100 | self.sp as u16);
-                self.status = Status::from_byte(flags);
-            }
-
-            // JMP — Jump (absolute and indirect)
-            OpCode::JmpAbsolute(_) | OpCode::JmpIndirect(_) => {
-                let addr = self.resolve_addr(&op, memory).unwrap();
-                // JMP sets PC directly — skip the normal pc += size advance
-                self.pc = addr;
-                return details.cycle_count;
-            }
-
-            // JSR — Jump to Subroutine (push return addr - 1, then jump)
-            OpCode::JsrAbsolute(addr) => {
-                let ret = self.pc + 2; // points to last byte of JSR instruction
-                memory.write(0x0100 | self.sp as u16, (ret >> 8) as u8);
-                self.sp = self.sp.wrapping_sub(1);
-                memory.write(0x0100 | self.sp as u16, ret as u8);
-                self.sp = self.sp.wrapping_sub(1);
-                self.pc = addr;
-                return details.cycle_count;
-            }
-
-            // RTS — Return from Subroutine
-            OpCode::RtsImplied => {
-                self.sp = self.sp.wrapping_add(1);
-                let lo = memory.read(0x0100 | self.sp as u16) as u16;
-                self.sp = self.sp.wrapping_add(1);
-                let hi = memory.read(0x0100 | self.sp as u16) as u16;
-                self.pc = ((hi << 8) | lo).wrapping_add(1);
-                return details.cycle_count;
-            }
-
-            // RTI — Return from Interrupt
-            OpCode::RtiImplied => {
-                self.sp = self.sp.wrapping_add(1);
-                let flags = memory.read(0x0100 | self.sp as u16);
-                self.status = Status::from_byte(flags);
-                self.sp = self.sp.wrapping_add(1);
-                let lo = memory.read(0x0100 | self.sp as u16) as u16;
-                self.sp = self.sp.wrapping_add(1);
-                let hi = memory.read(0x0100 | self.sp as u16) as u16;
-                self.pc = (hi << 8) | lo;
-                return details.cycle_count;
-            }
-
-            // BRK — Force Interrupt
-            OpCode::BrkImplied => {
-                let ret = self.pc + 2; // BRK skips the byte after it
-                memory.write(0x0100 | self.sp as u16, (ret >> 8) as u8);
-                self.sp = self.sp.wrapping_sub(1);
-                memory.write(0x0100 | self.sp as u16, ret as u8);
-                self.sp = self.sp.wrapping_sub(1);
-                let flags = self.status.to_byte_with_break(); // set break + unused
-                memory.write(0x0100 | self.sp as u16, flags);
-                self.sp = self.sp.wrapping_sub(1);
-                self.status.set(INTERRUPT, true);
-                let lo = memory.read(0xFFFE) as u16;
-                let hi = memory.read(0xFFFF) as u16;
-                self.pc = (hi << 8) | lo;
-                return details.cycle_count;
-            }
-
-            // Flag Instructions
-            OpCode::ClcImplied => { self.status.set(CARRY, false); }
-            OpCode::SecImplied => { self.status.set(CARRY, true); }
-            OpCode::CliImplied => { self.status.set(INTERRUPT, false); }
-            OpCode::SeiImplied => { self.status.set(INTERRUPT, true); }
-            OpCode::ClvImplied => { self.status.set(OVERFLOW, false); }
-            OpCode::CldImplied => { self.status.set(DECIMAL, false); }
-            OpCode::SedImplied => { self.status.set(DECIMAL, true); }
-
-            // Branch Instructions — all relative addressing
-            // +1 cycle if taken, +1 more if target crosses a page boundary
-            OpCode::BplRelative(off) | OpCode::BmiRelative(off) |
-            OpCode::BvcRelative(off) | OpCode::BvsRelative(off) |
-            OpCode::BccRelative(off) | OpCode::BcsRelative(off) |
-            OpCode::BneRelative(off) | OpCode::BeqRelative(off) => {
-                let taken = match op {
-                    OpCode::BplRelative(_) => !self.status.get(NEGATIVE),
-                    OpCode::BmiRelative(_) =>  self.status.get(NEGATIVE),
-                    OpCode::BvcRelative(_) => !self.status.get(OVERFLOW),
-                    OpCode::BvsRelative(_) =>  self.status.get(OVERFLOW),
-                    OpCode::BccRelative(_) => !self.status.get(CARRY),
-                    OpCode::BcsRelative(_) =>  self.status.get(CARRY),
-                    OpCode::BneRelative(_) => !self.status.get(ZERO),
-                    OpCode::BeqRelative(_) =>  self.status.get(ZERO),
+            // ==================================================================
+            // Zero Page write (3 cycles): STA, STX, STY
+            // ==================================================================
+            0x85 | 0x86 | 0x84 => {
+                // Cycle 2: fetch ZP address
+                let addr = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: write to ZP
+                let val = match opcode {
+                    0x85 => self.a,
+                    0x86 => self.x,
+                    0x84 => self.y,
                     _ => unreachable!(),
                 };
-                if taken {
-                    let next_pc = self.pc.wrapping_add(op.size());
-                    let target = next_pc.wrapping_add(off as i8 as u16);
-                    let page_cross = (next_pc & 0xFF00) != (target & 0xFF00);
-                    self.pc = target;
-                    return details.cycle_count + 1 + page_cross as u8;
+                memory.write(addr, val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Zero Page,X read (4 cycles): LDA, LDY, ADC, AND, CMP, EOR, ORA, SBC
+            // ==================================================================
+            0xB5 | 0xB4 | 0x75 | 0x35 | 0xD5 | 0x55 | 0x15 | 0xF5 => {
+                // Cycle 2: fetch ZP base
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of base (before adding X)
+                memory.read(base as u16);
+                cycles += 1;
+                // Cycle 4: read from (base+X) & 0xFF
+                let addr = base.wrapping_add(self.x) as u16;
+                let val = memory.read(addr);
+                cycles += 1;
+                match opcode {
+                    0xB5 => { self.a = val; self.status.set_zn(self.a); }
+                    0xB4 => { self.y = val; self.status.set_zn(self.y); }
+                    0x75 => self.adc(val),
+                    0xF5 => self.sbc(val),
+                    0x35 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x15 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x55 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xD5 => self.compare(self.a, val),
+                    _ => unreachable!(),
                 }
             }
 
-            // NOP
-            OpCode::NopImplied => {}
+            // ==================================================================
+            // Zero Page,X write (4 cycles): STA, STY
+            // ==================================================================
+            0x95 | 0x94 => {
+                // Cycle 2: fetch ZP base
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of base
+                memory.read(base as u16);
+                cycles += 1;
+                // Cycle 4: write to (base+X) & 0xFF
+                let addr = base.wrapping_add(self.x) as u16;
+                let val = match opcode {
+                    0x95 => self.a,
+                    0x94 => self.y,
+                    _ => unreachable!(),
+                };
+                memory.write(addr, val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Zero Page,Y read (4 cycles): LDX
+            // ==================================================================
+            0xB6 => {
+                // Cycle 2: fetch ZP base
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of base
+                memory.read(base as u16);
+                cycles += 1;
+                // Cycle 4: read from (base+Y) & 0xFF
+                let addr = base.wrapping_add(self.y) as u16;
+                let val = memory.read(addr);
+                cycles += 1;
+                self.x = val;
+                self.status.set_zn(self.x);
+            }
+
+            // ==================================================================
+            // Zero Page,Y write (4 cycles): STX
+            // ==================================================================
+            0x96 => {
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                memory.read(base as u16);
+                cycles += 1;
+                let addr = base.wrapping_add(self.y) as u16;
+                memory.write(addr, self.x);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Zero Page RMW (5 cycles): ASL, LSR, ROL, ROR, INC, DEC
+            // ==================================================================
+            0x06 | 0x46 | 0x26 | 0x66 | 0xE6 | 0xC6 => {
+                // Cycle 2: fetch ZP address
+                let addr = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: read value
+                let val = memory.read(addr);
+                cycles += 1;
+                // Cycle 4: phantom write of original value
+                memory.write(addr, val);
+                cycles += 1;
+                // Cycle 5: write new value
+                let new_val = match opcode {
+                    0x06 => self.asl_val(val),
+                    0x46 => self.lsr_val(val),
+                    0x26 => self.rol_val(val),
+                    0x66 => self.ror_val(val),
+                    0xE6 => { let r = val.wrapping_add(1); self.status.set_zn(r); r }
+                    0xC6 => { let r = val.wrapping_sub(1); self.status.set_zn(r); r }
+                    _ => unreachable!(),
+                };
+                memory.write(addr, new_val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Zero Page,X RMW (6 cycles): ASL, LSR, ROL, ROR, INC, DEC
+            // ==================================================================
+            0x16 | 0x56 | 0x36 | 0x76 | 0xF6 | 0xD6 => {
+                // Cycle 2: fetch ZP base
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of base
+                memory.read(base as u16);
+                cycles += 1;
+                // Cycle 4: read value from (base+X)&FF
+                let addr = base.wrapping_add(self.x) as u16;
+                let val = memory.read(addr);
+                cycles += 1;
+                // Cycle 5: phantom write of original value
+                memory.write(addr, val);
+                cycles += 1;
+                // Cycle 6: write new value
+                let new_val = match opcode {
+                    0x16 => self.asl_val(val),
+                    0x56 => self.lsr_val(val),
+                    0x36 => self.rol_val(val),
+                    0x76 => self.ror_val(val),
+                    0xF6 => { let r = val.wrapping_add(1); self.status.set_zn(r); r }
+                    0xD6 => { let r = val.wrapping_sub(1); self.status.set_zn(r); r }
+                    _ => unreachable!(),
+                };
+                memory.write(addr, new_val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Absolute read (4 cycles): LDA, LDX, LDY, ADC, AND, CMP, CPX,
+            //   CPY, EOR, ORA, SBC, BIT
+            // ==================================================================
+            0xAD | 0xAE | 0xAC | 0x6D | 0x2D | 0xCD | 0xEC |
+            0xCC | 0x4D | 0x0D | 0xED | 0x2C => {
+                // Cycle 2: fetch addr_lo
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: fetch addr_hi
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let addr = (hi << 8) | lo;
+                // Cycle 4: read from addr
+                let val = memory.read(addr);
+                cycles += 1;
+                match opcode {
+                    0xAD => { self.a = val; self.status.set_zn(self.a); }
+                    0xAE => { self.x = val; self.status.set_zn(self.x); }
+                    0xAC => { self.y = val; self.status.set_zn(self.y); }
+                    0x6D => self.adc(val),
+                    0xED => self.sbc(val),
+                    0x2D => { self.a &= val; self.status.set_zn(self.a); }
+                    0x0D => { self.a |= val; self.status.set_zn(self.a); }
+                    0x4D => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xCD => self.compare(self.a, val),
+                    0xEC => self.compare(self.x, val),
+                    0xCC => self.compare(self.y, val),
+                    0x2C => {
+                        self.status.set(ZERO, (self.a & val) == 0);
+                        self.status.set(OVERFLOW, val & 0x40 != 0);
+                        self.status.set(NEGATIVE, val & 0x80 != 0);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            // ==================================================================
+            // Absolute write (4 cycles): STA, STX, STY
+            // ==================================================================
+            0x8D | 0x8E | 0x8C => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let addr = (hi << 8) | lo;
+                let val = match opcode {
+                    0x8D => self.a,
+                    0x8E => self.x,
+                    0x8C => self.y,
+                    _ => unreachable!(),
+                };
+                memory.write(addr, val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Absolute RMW (6 cycles): ASL, LSR, ROL, ROR, INC, DEC
+            // ==================================================================
+            0x0E | 0x4E | 0x2E | 0x6E | 0xEE | 0xCE => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let addr = (hi << 8) | lo;
+                // Cycle 4: read value
+                let val = memory.read(addr);
+                cycles += 1;
+                // Cycle 5: phantom write original
+                memory.write(addr, val);
+                cycles += 1;
+                // Cycle 6: write new
+                let new_val = match opcode {
+                    0x0E => self.asl_val(val),
+                    0x4E => self.lsr_val(val),
+                    0x2E => self.rol_val(val),
+                    0x6E => self.ror_val(val),
+                    0xEE => { let r = val.wrapping_add(1); self.status.set_zn(r); r }
+                    0xCE => { let r = val.wrapping_sub(1); self.status.set_zn(r); r }
+                    _ => unreachable!(),
+                };
+                memory.write(addr, new_val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Absolute,X read (4+1 cycles): LDA, LDY, ADC, AND, CMP, EOR, ORA, SBC
+            // ==================================================================
+            0xBD | 0xBC | 0x7D | 0x3D | 0xDD | 0x5D | 0x1D | 0xFD => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.x as u16);
+                let page_crossed = (base & 0xFF00) != (effective & 0xFF00);
+                if page_crossed {
+                    // Cycle 4: phantom read with wrong high byte
+                    let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                    memory.read(wrong_addr);
+                    cycles += 1;
+                }
+                // Cycle 4 or 5: real read
+                let val = memory.read(effective);
+                cycles += 1;
+                match opcode {
+                    0xBD => { self.a = val; self.status.set_zn(self.a); }
+                    0xBC => { self.y = val; self.status.set_zn(self.y); }
+                    0x7D => self.adc(val),
+                    0xFD => self.sbc(val),
+                    0x3D => { self.a &= val; self.status.set_zn(self.a); }
+                    0x1D => { self.a |= val; self.status.set_zn(self.a); }
+                    0x5D => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xDD => self.compare(self.a, val),
+                    _ => unreachable!(),
+                }
+            }
+
+            // ==================================================================
+            // Absolute,X write (5 cycles always): STA
+            // ==================================================================
+            0x9D => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.x as u16);
+                // Cycle 4: phantom read (fixup high byte)
+                let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                memory.read(wrong_addr);
+                cycles += 1;
+                // Cycle 5: write
+                memory.write(effective, self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Absolute,X RMW (7 cycles): ASL, LSR, ROL, ROR, INC, DEC
+            // ==================================================================
+            0x1E | 0x5E | 0x3E | 0x7E | 0xFE | 0xDE => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.x as u16);
+                // Cycle 4: phantom read (fixup) - always happens for RMW
+                let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                memory.read(wrong_addr);
+                cycles += 1;
+                // Cycle 5: read value
+                let val = memory.read(effective);
+                cycles += 1;
+                // Cycle 6: phantom write original
+                memory.write(effective, val);
+                cycles += 1;
+                // Cycle 7: write new
+                let new_val = match opcode {
+                    0x1E => self.asl_val(val),
+                    0x5E => self.lsr_val(val),
+                    0x3E => self.rol_val(val),
+                    0x7E => self.ror_val(val),
+                    0xFE => { let r = val.wrapping_add(1); self.status.set_zn(r); r }
+                    0xDE => { let r = val.wrapping_sub(1); self.status.set_zn(r); r }
+                    _ => unreachable!(),
+                };
+                memory.write(effective, new_val);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Absolute,Y read (4+1 cycles): LDA, LDX, ADC, AND, CMP, EOR, ORA, SBC
+            // ==================================================================
+            0xB9 | 0xBE | 0x79 | 0x39 | 0xD9 | 0x59 | 0x19 | 0xF9 => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.y as u16);
+                let page_crossed = (base & 0xFF00) != (effective & 0xFF00);
+                if page_crossed {
+                    let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                    memory.read(wrong_addr);
+                    cycles += 1;
+                }
+                let val = memory.read(effective);
+                cycles += 1;
+                match opcode {
+                    0xB9 => { self.a = val; self.status.set_zn(self.a); }
+                    0xBE => { self.x = val; self.status.set_zn(self.x); }
+                    0x79 => self.adc(val),
+                    0xF9 => self.sbc(val),
+                    0x39 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x19 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x59 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xD9 => self.compare(self.a, val),
+                    _ => unreachable!(),
+                }
+            }
+
+            // ==================================================================
+            // Absolute,Y write (5 cycles always): STA
+            // ==================================================================
+            0x99 => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.y as u16);
+                let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                memory.read(wrong_addr);
+                cycles += 1;
+                memory.write(effective, self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Indirect,X read (6 cycles): LDA, ADC, AND, CMP, EOR, ORA, SBC
+            // ==================================================================
+            0xA1 | 0x61 | 0x21 | 0xC1 | 0x41 | 0x01 | 0xE1 => {
+                // Cycle 2: fetch ZP base
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of ZP base (before adding X)
+                memory.read(base as u16);
+                cycles += 1;
+                // Cycle 4: read ptr_lo from (base+X) & FF
+                let ptr = base.wrapping_add(self.x);
+                let lo = memory.read(ptr as u16) as u16;
+                cycles += 1;
+                // Cycle 5: read ptr_hi from (base+X+1) & FF
+                let hi = memory.read(ptr.wrapping_add(1) as u16) as u16;
+                cycles += 1;
+                let addr = (hi << 8) | lo;
+                // Cycle 6: read from target
+                let val = memory.read(addr);
+                cycles += 1;
+                match opcode {
+                    0xA1 => { self.a = val; self.status.set_zn(self.a); }
+                    0x61 => self.adc(val),
+                    0xE1 => self.sbc(val),
+                    0x21 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x01 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x41 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xC1 => self.compare(self.a, val),
+                    _ => unreachable!(),
+                }
+            }
+
+            // ==================================================================
+            // Indirect,X write (6 cycles): STA
+            // ==================================================================
+            0x81 => {
+                let base = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                memory.read(base as u16);
+                cycles += 1;
+                let ptr = base.wrapping_add(self.x);
+                let lo = memory.read(ptr as u16) as u16;
+                cycles += 1;
+                let hi = memory.read(ptr.wrapping_add(1) as u16) as u16;
+                cycles += 1;
+                let addr = (hi << 8) | lo;
+                memory.write(addr, self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Indirect,Y read (5+1 cycles): LDA, ADC, AND, CMP, EOR, ORA, SBC
+            // ==================================================================
+            0xB1 | 0x71 | 0x31 | 0xD1 | 0x51 | 0x11 | 0xF1 => {
+                // Cycle 2: fetch ZP pointer
+                let zp = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: read ptr_lo
+                let lo = memory.read(zp as u16) as u16;
+                cycles += 1;
+                // Cycle 4: read ptr_hi
+                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.y as u16);
+                let page_crossed = (base & 0xFF00) != (effective & 0xFF00);
+                if page_crossed {
+                    // Cycle 5: phantom read with wrong high byte
+                    let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                    memory.read(wrong_addr);
+                    cycles += 1;
+                }
+                // Cycle 5 or 6: real read
+                let val = memory.read(effective);
+                cycles += 1;
+                match opcode {
+                    0xB1 => { self.a = val; self.status.set_zn(self.a); }
+                    0x71 => self.adc(val),
+                    0xF1 => self.sbc(val),
+                    0x31 => { self.a &= val; self.status.set_zn(self.a); }
+                    0x11 => { self.a |= val; self.status.set_zn(self.a); }
+                    0x51 => { self.a ^= val; self.status.set_zn(self.a); }
+                    0xD1 => self.compare(self.a, val),
+                    _ => unreachable!(),
+                }
+            }
+
+            // ==================================================================
+            // Indirect,Y write (6 cycles always): STA
+            // ==================================================================
+            0x91 => {
+                let zp = memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let lo = memory.read(zp as u16) as u16;
+                cycles += 1;
+                let hi = memory.read(zp.wrapping_add(1) as u16) as u16;
+                cycles += 1;
+                let base = (hi << 8) | lo;
+                let effective = base.wrapping_add(self.y as u16);
+                // Cycle 5: phantom read (fixup) - always for write
+                let wrong_addr = (base & 0xFF00) | (effective & 0x00FF);
+                memory.read(wrong_addr);
+                cycles += 1;
+                // Cycle 6: write
+                memory.write(effective, self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // Branch instructions (2/3/4 cycles)
+            // ==================================================================
+            0x90 | 0xB0 | 0xF0 | 0x30 | 0xD0 | 0x10 | 0x50 | 0x70 => {
+                // Cycle 2: fetch offset
+                let offset = memory.read(self.pc) as i8;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+
+                let taken = match opcode {
+                    0x90 => !self.status.get(CARRY),     // BCC
+                    0xB0 =>  self.status.get(CARRY),     // BCS
+                    0xF0 =>  self.status.get(ZERO),      // BEQ
+                    0x30 =>  self.status.get(NEGATIVE),   // BMI
+                    0xD0 => !self.status.get(ZERO),      // BNE
+                    0x10 => !self.status.get(NEGATIVE),   // BPL
+                    0x50 => !self.status.get(OVERFLOW),   // BVC
+                    0x70 =>  self.status.get(OVERFLOW),   // BVS
+                    _ => unreachable!(),
+                };
+
+                if taken {
+                    // Cycle 3: phantom read of PC (branch taken)
+                    memory.read(self.pc);
+                    cycles += 1;
+
+                    let old_pc = self.pc;
+                    // Add offset to low byte only first
+                    let new_pc = self.pc.wrapping_add(offset as u16);
+                    let page_crossed = (old_pc & 0xFF00) != (new_pc & 0xFF00);
+
+                    if page_crossed {
+                        // Cycle 4: phantom read with partially-fixed PC
+                        // The CPU has fixed the low byte but not the high byte yet
+                        let partial_pc = (old_pc & 0xFF00) | (new_pc & 0x00FF);
+                        memory.read(partial_pc);
+                        cycles += 1;
+                    }
+
+                    self.pc = new_pc;
+                }
+            }
+
+            // ==================================================================
+            // JMP absolute (3 cycles)
+            // ==================================================================
+            0x4C => {
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                cycles += 1;
+                self.pc = (hi << 8) | lo;
+            }
+
+            // ==================================================================
+            // JMP indirect (5 cycles, with page-boundary bug)
+            // ==================================================================
+            0x6C => {
+                // Cycle 2-3: fetch pointer address
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let hi = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                let ptr = (hi << 8) | lo;
+                // Cycle 4: read target_lo from pointer
+                let target_lo = memory.read(ptr) as u16;
+                cycles += 1;
+                // Cycle 5: read target_hi (with page boundary bug)
+                let ptr_hi = (ptr & 0xFF00) | ((ptr.wrapping_add(1)) & 0x00FF);
+                let target_hi = memory.read(ptr_hi) as u16;
+                cycles += 1;
+                self.pc = (target_hi << 8) | target_lo;
+            }
+
+            // ==================================================================
+            // JSR (6 cycles)
+            // ==================================================================
+            0x20 => {
+                // Cycle 2: fetch addr_lo
+                let lo = memory.read(self.pc) as u16;
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: phantom read of stack pointer
+                memory.read(0x0100 | self.sp as u16);
+                cycles += 1;
+                // Cycle 4: push return address high byte
+                // PC currently points to the hi byte of the JSR operand.
+                // We push PC (which is addr of hi byte = last byte of JSR).
+                // RTS will add 1 to the pulled address.
+                let ret = self.pc;
+                self.push(memory, (ret >> 8) as u8);
+                cycles += 1;
+                // Cycle 5: push return address low byte
+                self.push(memory, ret as u8);
+                cycles += 1;
+                // Cycle 6: fetch addr_hi
+                let hi = memory.read(self.pc) as u16;
+                cycles += 1;
+                self.pc = (hi << 8) | lo;
+            }
+
+            // ==================================================================
+            // RTS (6 cycles)
+            // ==================================================================
+            0x60 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: phantom read of current SP
+                memory.read(0x0100 | self.sp as u16);
+                cycles += 1;
+                // Cycle 4: pull return address low byte
+                let ret_lo = self.pull(memory) as u16;
+                cycles += 1;
+                // Cycle 5: pull return address high byte
+                let ret_hi = self.pull(memory) as u16;
+                cycles += 1;
+                // Cycle 6: phantom read / increment PC
+                let ret_addr = (ret_hi << 8) | ret_lo;
+                memory.read(ret_addr);
+                cycles += 1;
+                self.pc = ret_addr.wrapping_add(1);
+            }
+
+            // ==================================================================
+            // RTI (6 cycles)
+            // ==================================================================
+            0x40 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: phantom read of SP
+                memory.read(0x0100 | self.sp as u16);
+                cycles += 1;
+                // Cycle 4: pull status
+                let flags = self.pull(memory);
+                self.status = Status::from_byte(flags);
+                cycles += 1;
+                // Cycle 5: pull PC low
+                let pc_lo = self.pull(memory) as u16;
+                cycles += 1;
+                // Cycle 6: pull PC high
+                let pc_hi = self.pull(memory) as u16;
+                cycles += 1;
+                self.pc = (pc_hi << 8) | pc_lo;
+            }
+
+            // ==================================================================
+            // BRK (7 cycles)
+            // ==================================================================
+            0x00 => {
+                // Cycle 2: phantom read of PC (and advance PC past padding byte)
+                memory.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                cycles += 1;
+                // Cycle 3: push PC high
+                self.push(memory, (self.pc >> 8) as u8);
+                cycles += 1;
+                // Cycle 4: push PC low
+                self.push(memory, self.pc as u8);
+                cycles += 1;
+                // Cycle 5: push status (with break flag set)
+                let flags = self.status.to_byte_with_break();
+                self.push(memory, flags);
+                cycles += 1;
+                // Set interrupt disable
+                self.status.set(INTERRUPT, true);
+                // Cycle 6: read IRQ vector low
+                let vec_lo = memory.read(0xFFFE) as u16;
+                cycles += 1;
+                // Cycle 7: read IRQ vector high
+                let vec_hi = memory.read(0xFFFF) as u16;
+                cycles += 1;
+                self.pc = (vec_hi << 8) | vec_lo;
+            }
+
+            // ==================================================================
+            // PHA (3 cycles)
+            // ==================================================================
+            0x48 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: write A to stack
+                self.push(memory, self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // PHP (3 cycles)
+            // ==================================================================
+            0x08 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: write flags to stack
+                let flags = self.status.to_byte_with_break();
+                self.push(memory, flags);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // PLA (4 cycles)
+            // ==================================================================
+            0x68 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: phantom read of SP (before increment)
+                memory.read(0x0100 | self.sp as u16);
+                cycles += 1;
+                // Cycle 4: pull A from stack
+                self.a = self.pull(memory);
+                self.status.set_zn(self.a);
+                cycles += 1;
+            }
+
+            // ==================================================================
+            // PLP (4 cycles)
+            // ==================================================================
+            0x28 => {
+                // Cycle 2: phantom read of PC
+                memory.read(self.pc);
+                cycles += 1;
+                // Cycle 3: phantom read of SP (before increment)
+                memory.read(0x0100 | self.sp as u16);
+                cycles += 1;
+                // Cycle 4: pull flags from stack
+                let flags = self.pull(memory);
+                self.status = Status::from_byte(flags);
+                cycles += 1;
+            }
+
+            _ => {
+                panic!("illegal opcode: 0x{:02X} at PC=0x{:04X}", opcode, self.pc.wrapping_sub(1));
+            }
         }
 
-        let penalty = if details.extra_cycle_on_page_bound_cross {
-            self.page_cross_penalty(&op, memory)
-        } else {
-            0
-        };
-
-        self.pc += op.size();
-        details.cycle_count + penalty
-    }
-}
-
-/// Trait for memory-mapped bus access.
-pub trait Memory {
-    fn read(&mut self, addr: u16) -> u8;
-    fn write(&mut self, addr: u16, val: u8);
-}
-
-/// Flat 64KB RAM for testing purposes.
-pub struct FlatMemory {
-    pub ram: [u8; 0x10000],
-}
-
-impl Default for FlatMemory {
-    fn default() -> Self {
-        Self { ram: [0; 0x10000] }
-    }
-}
-
-impl FlatMemory {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Load a binary blob at the given base address.
-    pub fn load(&mut self, base: u16, data: &[u8]) {
-        let start = base as usize;
-        self.ram[start..start + data.len()].copy_from_slice(data);
-    }
-}
-
-impl Memory for FlatMemory {
-    fn read(&mut self, addr: u16) -> u8 {
-        self.ram[addr as usize]
-    }
-
-    fn write(&mut self, addr: u16, val: u8) {
-        self.ram[addr as usize] = val;
+        self.cycles += cycles as u64;
+        cycles
     }
 }
