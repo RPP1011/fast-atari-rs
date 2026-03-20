@@ -6,16 +6,14 @@ fn main() {
     let rom = std::fs::read("Breakout.bin").expect("Place Breakout.bin in project root");
 
     let variants: &[(&str, KernelVariant)] = &[
-        ("Phase 2: default",  KernelVariant::Default),
-        ("Phase 5: __ldg()",  KernelVariant::Ldg),
-        ("Phase 4: sorted",   KernelVariant::Sorted),
+        ("Phase 6: AOT",      KernelVariant::Aot),
     ];
 
     for &(label, variant) in variants {
         println!("=== {} ===", label);
         for &n in &[1000, 5000, 10000, 50000] {
             let mut gpu = BatchAtariGpu::new(rom.clone(), n).unwrap();
-            gpu.set_variant(variant);
+            gpu.set_variant(variant).unwrap();
             gpu.reset().unwrap();
 
             let actions = vec![0u8; n];

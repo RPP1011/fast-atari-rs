@@ -12,7 +12,7 @@ mod ldg_tests {
         let rom = load_rom();
         let n = 10;
         let mut gpu = BatchAtariGpu::new(rom.clone(), n).unwrap();
-        gpu.set_variant(KernelVariant::Ldg);
+        gpu.set_variant(KernelVariant::Ldg).unwrap();
         gpu.reset().unwrap();
 
         let mut cpus: Vec<HeadlessAtari> = (0..n)

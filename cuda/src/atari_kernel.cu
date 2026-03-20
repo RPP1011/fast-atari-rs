@@ -1,4 +1,5 @@
 #include "cpu_6502.cuh"
+#include "cpu_6502_aot.cuh"
 #include "opcode_sort.cuh"
 
 // NOTE: Opcode sorting (Phase 4) adds warp shuffle overhead per instruction.
@@ -291,6 +292,103 @@ void atari_frame_kernel_ldg(
     for (int i = 0; i < 128; i++) {
         uint8_t v = my_ram[i];
         gram_out[i] = v;
+        obs[i] = v;
+    }
+}
+
+// ============================================================
+// Phase 6: AOT pre-decoded ROM table
+// Eliminates bus_read for opcode/operand fetch (~30 branches/instr).
+// ============================================================
+
+__device__ __forceinline__
+void run_one_cycle_aot(ThreadCtx* c, uint8_t* mr, uint64_t* cycles,
+                       const uint8_t* rp, uint32_t rl,
+                       const DecodedOp* __restrict__ dt) {
+    if (c->tia_wsync) {
+        uint16_t skipped = tia_skip_to_scanline_end(c);
+        pia_tick_n(c, skipped);
+        *cycles += skipped;
+    } else {
+        uint8_t cy = cpu_step_aot(c, mr, rp, rl, dt);
+        *cycles += cy;
+        tia_tick_n(c, cy);
+        pia_tick_n(c, (uint16_t)cy);
+    }
+}
+
+__device__
+void run_frame_aot(ThreadCtx* c, uint8_t* mr, const uint8_t* rp, uint32_t rl,
+                   const DecodedOp* __restrict__ dt) {
+    c->tia_frame_complete = 0;
+    uint64_t cycles = 0;
+
+    while (c->tia_vsync & 0x02)
+        run_one_cycle_aot(c, mr, &cycles, rp, rl, dt);
+
+    while (!(c->tia_vsync & 0x02)) {
+        run_one_cycle_aot(c, mr, &cycles, rp, rl, dt);
+        if (cycles > 100000) break;
+    }
+}
+
+extern "C"
+__global__
+void atari_frame_kernel_aot(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,
+    uint8_t* __restrict__ obs_out,
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    const DecodedOp* __restrict__ decode_table,
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    uint8_t* my_ram = sram[threadIdx.x];
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+    for (int i = 0; i < 128; i++) my_ram[i] = states[idx].ram[i];
+    apply_action(&ctx, actions[idx]);
+    run_frame_aot(&ctx, my_ram, rom_ptr, rom_len, decode_table);
+    store_ctx(&states[idx], &ctx);
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        states[idx].ram[i] = v;
+        obs[i] = v;
+    }
+}
+
+extern "C"
+__global__
+void atari_multi_frame_kernel_aot(
+    AtariState* __restrict__ states,
+    const uint8_t* __restrict__ actions,
+    uint8_t* __restrict__ obs_out,
+    const uint8_t* __restrict__ rom_ptr,
+    uint32_t rom_len,
+    const DecodedOp* __restrict__ decode_table,
+    int K,
+    int N
+) {
+    __shared__ uint8_t sram[BLOCK_SIZE][128];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    uint8_t* my_ram = sram[threadIdx.x];
+    ThreadCtx ctx;
+    load_ctx(&ctx, &states[idx]);
+    for (int i = 0; i < 128; i++) my_ram[i] = states[idx].ram[i];
+    for (int f = 0; f < K; f++) {
+        apply_action(&ctx, actions[f * N + idx]);
+        run_frame_aot(&ctx, my_ram, rom_ptr, rom_len, decode_table);
+    }
+    store_ctx(&states[idx], &ctx);
+    uint8_t* obs = &obs_out[idx * 128];
+    for (int i = 0; i < 128; i++) {
+        uint8_t v = my_ram[i];
+        states[idx].ram[i] = v;
         obs[i] = v;
     }
 }

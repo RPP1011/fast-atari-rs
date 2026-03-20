@@ -41,4 +41,7 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed=cuda/src/tia_headless.cuh");
     println!("cargo:rerun-if-changed=cuda/src/pia.cuh");
     println!("cargo:rerun-if-changed=cuda/src/state_layout.cuh");
+    println!("cargo:rerun-if-changed=cuda/src/opcode_sort.cuh");
+    println!("cargo:rerun-if-changed=cuda/src/decoded_op.cuh");
+    println!("cargo:rerun-if-changed=cuda/src/cpu_6502_aot.cuh");
 }

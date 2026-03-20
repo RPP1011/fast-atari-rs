@@ -94,6 +94,98 @@ impl AtariStateGpu {
 }
 
 // ============================================================
+// DecodedOp: pre-decoded instruction for AOT ROM table.
+// Must match the CUDA DecodedOp struct layout exactly (8 bytes).
+// ============================================================
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DecodedOpGpu {
+    pub opcode: u8,
+    pub size: u8,
+    pub cycles: u8,
+    pub _pad0: u8,
+    pub operand: u16,
+    pub _pad1: u16,
+}
+
+unsafe impl DeviceRepr for DecodedOpGpu {}
+unsafe impl ValidAsZeroBits for DecodedOpGpu {}
+
+// 6502 cycle counts per opcode (matches CYCLE_TABLE in cpu_6502.cuh)
+const CYCLE_TABLE: [u8; 256] = [
+    7,6,0,0,0,3,5,0,3,2,2,0,0,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    6,6,0,0,3,3,5,0,4,2,2,0,4,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    6,6,0,0,0,3,5,0,3,2,2,0,3,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    6,6,0,0,0,3,5,0,4,2,2,0,5,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    0,6,0,0,3,3,3,0,2,0,2,0,4,4,4,0, 2,6,0,0,4,4,4,0,2,5,2,0,5,5,0,0,
+    2,6,2,0,3,3,3,0,2,2,2,0,4,4,4,0, 2,5,0,0,4,4,4,0,2,4,2,0,4,4,4,0,
+    2,6,0,0,3,3,5,0,2,2,2,0,4,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    2,6,0,0,3,3,5,0,2,2,2,0,4,4,6,0, 2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+];
+
+// 6502 instruction sizes per opcode (matches SIZE_TABLE in cpu_6502.cuh)
+const SIZE_TABLE: [u8; 256] = [
+    1,2,1,1,1,2,2,1,1,2,1,1,1,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+    3,2,1,1,2,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+    1,2,1,1,1,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+    1,2,1,1,1,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+    1,2,1,1,2,2,2,1,1,1,1,1,3,3,3,1, 2,2,1,1,2,2,2,1,1,3,1,1,3,3,1,1,
+    2,2,2,1,2,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,2,2,2,1,1,3,1,1,3,3,3,1,
+    2,2,1,1,2,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+    2,2,1,1,2,2,2,1,1,2,1,1,3,3,3,1, 2,2,1,1,1,2,2,1,1,3,1,1,1,3,3,1,
+];
+
+/// Build the AOT decode table for all banks of the ROM.
+/// Returns `num_banks * 4096` DecodedOp entries.
+pub fn build_decode_table(rom: &[u8], scheme: BankScheme) -> Vec<DecodedOpGpu> {
+    let num_banks = match scheme {
+        BankScheme::Fixed => 1,
+        BankScheme::F8 => 2,
+        BankScheme::F6 => 4,
+        BankScheme::F4 => 8,
+    };
+    let rom_len = rom.len();
+    let mut table = vec![DecodedOpGpu::default(); num_banks * 4096];
+
+    for bank in 0..num_banks {
+        for offset in 0..4096u16 {
+            let rom_byte = |addr: u16| -> u8 {
+                let a = addr & 0x0FFF;
+                if scheme == BankScheme::Fixed {
+                    rom[(a as usize) % rom_len]
+                } else {
+                    let idx = bank * 4096 + (a as usize);
+                    if idx < rom_len { rom[idx] } else { 0 }
+                }
+            };
+
+            let opcode = rom_byte(offset);
+            let size = SIZE_TABLE[opcode as usize];
+            let cycles = CYCLE_TABLE[opcode as usize];
+            let operand = match size {
+                2 => rom_byte(offset.wrapping_add(1)) as u16,
+                3 => {
+                    let lo = rom_byte(offset.wrapping_add(1)) as u16;
+                    let hi = rom_byte(offset.wrapping_add(2)) as u16;
+                    lo | (hi << 8)
+                }
+                _ => 0,
+            };
+
+            table[bank * 4096 + offset as usize] = DecodedOpGpu {
+                opcode,
+                size,
+                cycles,
+                _pad0: 0,
+                operand,
+                _pad1: 0,
+            };
+        }
+    }
+    table
+}
+
+// ============================================================
 // Batch GPU Atari environment (per-frame kernel, Phase 2)
 // ============================================================
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,6 +193,7 @@ pub enum KernelVariant {
     Default,
     Sorted,
     Ldg,
+    Aot,
 }
 
 pub struct BatchAtariGpu {
@@ -113,28 +206,72 @@ pub struct BatchAtariGpu {
     d_rom: CudaSlice<u8>,
     rom_len: u32,
     variant: KernelVariant,
+    d_decode_table: Option<CudaSlice<DecodedOpGpu>>,
 }
 
 impl BatchAtariGpu {
     pub fn new(rom: Vec<u8>, n: usize) -> Result<Self, DriverError> {
         let dev = CudaDevice::new(0)?;
         let ptx = include_str!(concat!(env!("OUT_DIR"), "/atari_kernel.ptx"));
+        let kernel_names: &[&'static str] = &[
+            "atari_frame_kernel", "atari_multi_frame_kernel",
+            "atari_frame_kernel_sorted", "atari_multi_frame_kernel_sorted",
+            "atari_frame_kernel_ldg",
+            "atari_frame_kernel_aot", "atari_multi_frame_kernel_aot",
+        ];
         dev.load_ptx(
-            cudarc::nvrtc::Ptx::from_src(ptx), "atari",
-            &["atari_frame_kernel", "atari_multi_frame_kernel",
-              "atari_frame_kernel_sorted", "atari_multi_frame_kernel_sorted",
-              "atari_frame_kernel_ldg"],
+            cudarc::nvrtc::Ptx::from_src(ptx), "atari", kernel_names,
         )?;
+
+        // Request maximum shared memory carveout (100KB on sm_89) for all kernels.
+        // This allows 6 blocks/SM instead of 5 (6 × 16KB = 96KB < 100KB).
+        // We use the raw module API to get CUfunction handles since cudarc's
+        // CudaFunction.cu_function is pub(crate).
+        {
+            let lib = unsafe { sys::lib() };
+            // Get the CUmodule from cudarc's internal storage by loading it again
+            // (cudarc caches modules, so this is safe)
+            let ptx_cstr = std::ffi::CString::new(ptx).unwrap();
+            let cu_module = unsafe {
+                result::module::load_data(ptx_cstr.as_ptr() as *const _)?
+            };
+            for &name in kernel_names {
+                let name_c = std::ffi::CString::new(name).unwrap();
+                if let Ok(cu_func) = unsafe { result::module::get_function(cu_module, name_c) } {
+                    unsafe {
+                        let _ = (lib.cuFuncSetAttribute.as_ref().unwrap())(
+                            cu_func,
+                            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                            100,
+                        );
+                    }
+                }
+            }
+            // Don't unload — cudarc still owns the module
+            // The duplicate load is harmless (driver deduplicates)
+        }
+
         let rom_len = rom.len() as u32;
         let d_rom = dev.htod_copy(rom.clone())?;
         let d_states = dev.alloc_zeros::<AtariStateGpu>(n)?;
         let d_actions = dev.alloc_zeros::<u8>(n)?;
         let d_obs = dev.alloc_zeros::<u8>(n * 128)?;
-        Ok(Self { dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len, variant: KernelVariant::Default })
+        Ok(Self {
+            dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len,
+            variant: KernelVariant::Default, d_decode_table: None,
+        })
     }
 
-    /// Set kernel variant.
-    pub fn set_variant(&mut self, v: KernelVariant) { self.variant = v; }
+    /// Set kernel variant. For Aot, lazily builds and uploads the decode table.
+    pub fn set_variant(&mut self, v: KernelVariant) -> Result<(), DriverError> {
+        self.variant = v;
+        if v == KernelVariant::Aot && self.d_decode_table.is_none() {
+            let scheme = BankScheme::detect(self.rom.len());
+            let table = build_decode_table(&self.rom, scheme);
+            self.d_decode_table = Some(self.dev.htod_copy(table)?);
+        }
+        Ok(())
+    }
 
     /// Convenience: enable sorted mode.
     pub fn set_sorted(&mut self, sorted: bool) {
@@ -162,17 +299,32 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let name = match self.variant {
-            KernelVariant::Default => "atari_frame_kernel",
-            KernelVariant::Sorted => "atari_frame_kernel_sorted",
-            KernelVariant::Ldg => "atari_frame_kernel_ldg",
-        };
-        let func = self.dev.get_func("atari", name).unwrap();
-        unsafe {
-            func.launch(cfg, (
-                &mut self.d_states, &self.d_actions, &mut self.d_obs,
-                &self.d_rom, self.rom_len, self.n as i32,
-            ))?;
+        match self.variant {
+            KernelVariant::Aot => {
+                let func = self.dev.get_func("atari", "atari_frame_kernel_aot").unwrap();
+                let dt = self.d_decode_table.as_ref().expect("decode table not initialized; call set_variant(Aot) first");
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &self.d_actions, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, dt, self.n as i32,
+                    ))?;
+                }
+            }
+            _ => {
+                let name = match self.variant {
+                    KernelVariant::Default => "atari_frame_kernel",
+                    KernelVariant::Sorted => "atari_frame_kernel_sorted",
+                    KernelVariant::Ldg => "atari_frame_kernel_ldg",
+                    KernelVariant::Aot => unreachable!(),
+                };
+                let func = self.dev.get_func("atari", name).unwrap();
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &self.d_actions, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, self.n as i32,
+                    ))?;
+                }
+            }
         }
         self.dev.dtoh_sync_copy(&self.d_obs)
     }
@@ -189,16 +341,30 @@ impl BatchAtariGpu {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 0,
         };
-        let name = match self.variant {
-            KernelVariant::Sorted => "atari_multi_frame_kernel_sorted",
-            _ => "atari_multi_frame_kernel",
-        };
-        let func = self.dev.get_func("atari", name).unwrap();
-        unsafe {
-            func.launch(cfg, (
-                &mut self.d_states, &d_actions_multi, &mut self.d_obs,
-                &self.d_rom, self.rom_len, k as i32, self.n as i32,
-            ))?;
+        match self.variant {
+            KernelVariant::Aot => {
+                let func = self.dev.get_func("atari", "atari_multi_frame_kernel_aot").unwrap();
+                let dt = self.d_decode_table.as_ref().expect("decode table not initialized; call set_variant(Aot) first");
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &d_actions_multi, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, dt, k as i32, self.n as i32,
+                    ))?;
+                }
+            }
+            _ => {
+                let name = match self.variant {
+                    KernelVariant::Sorted => "atari_multi_frame_kernel_sorted",
+                    _ => "atari_multi_frame_kernel",
+                };
+                let func = self.dev.get_func("atari", name).unwrap();
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &d_actions_multi, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, k as i32, self.n as i32,
+                    ))?;
+                }
+            }
         }
         self.dev.dtoh_sync_copy(&self.d_obs)
     }
