@@ -194,6 +194,7 @@ pub enum KernelVariant {
     Sorted,
     Ldg,
     Aot,
+    Compiled,
 }
 
 pub struct BatchAtariGpu {
@@ -207,6 +208,7 @@ pub struct BatchAtariGpu {
     rom_len: u32,
     variant: KernelVariant,
     d_decode_table: Option<CudaSlice<DecodedOpGpu>>,
+    compiled_loaded: bool,
 }
 
 impl BatchAtariGpu {
@@ -258,18 +260,114 @@ impl BatchAtariGpu {
         let d_obs = dev.alloc_zeros::<u8>(n * 128)?;
         Ok(Self {
             dev, n, rom, d_states, d_actions, d_obs, d_rom, rom_len,
-            variant: KernelVariant::Default, d_decode_table: None,
+            variant: KernelVariant::Default, d_decode_table: None, compiled_loaded: false,
         })
     }
 
-    /// Set kernel variant. For Aot, lazily builds and uploads the decode table.
+    /// Set kernel variant. For Aot/Compiled, lazily builds and uploads the decode table.
+    /// For Compiled, also generates and compiles the ROM-specific kernel via nvrtc.
     pub fn set_variant(&mut self, v: KernelVariant) -> Result<(), DriverError> {
         self.variant = v;
-        if v == KernelVariant::Aot && self.d_decode_table.is_none() {
+        let needs_decode_table = v == KernelVariant::Aot || v == KernelVariant::Compiled;
+        if needs_decode_table && self.d_decode_table.is_none() {
             let scheme = BankScheme::detect(self.rom.len());
             let table = build_decode_table(&self.rom, scheme);
             self.d_decode_table = Some(self.dev.htod_copy(table)?);
         }
+        if v == KernelVariant::Compiled && !self.compiled_loaded {
+            self.compile_rom_kernel()?;
+        }
+        Ok(())
+    }
+
+    /// Generate and compile a ROM-specific kernel via nvrtc.
+    /// Caches compiled PTX on disk keyed by ROM hash to avoid repeat compilations.
+    fn compile_rom_kernel(&mut self) -> Result<(), DriverError> {
+        use crate::rom_compiler::{discover_blocks, generate_compiled_source, print_block_summary};
+        use std::io::Write;
+
+        let compiled_kernel_names: &[&str] = &[
+            "atari_frame_kernel_compiled",
+            "atari_multi_frame_kernel_compiled",
+        ];
+
+        // Hash ROM for cache key
+        let rom_hash = {
+            let mut h: u64 = 0xcbf29ce484222325; // FNV-1a
+            for &b in &self.rom {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
+        let cache_dir = std::path::PathBuf::from(".compiled_kernel_cache");
+        let cache_path = cache_dir.join(format!("{:016x}.ptx", rom_hash));
+
+        // Try loading from cache
+        let ptx_src_string = if cache_path.exists() {
+            eprintln!("Compiled kernel: loading cached PTX from {}", cache_path.display());
+            std::fs::read_to_string(&cache_path).ok()
+        } else {
+            None
+        };
+
+        let ptx_src_string = match ptx_src_string {
+            Some(s) => s,
+            None => {
+                // Generate and compile
+                let scheme = BankScheme::detect(self.rom.len());
+                let blocks = discover_blocks(&self.rom, scheme);
+                print_block_summary(&blocks);
+
+                let cuda_src = generate_compiled_source(&blocks, &self.rom, scheme);
+
+                let opts = cudarc::nvrtc::CompileOptions {
+                    arch: Some("sm_89"),
+                    use_fast_math: Some(true),
+                    ..Default::default()
+                };
+                let ptx = cudarc::nvrtc::compile_ptx_with_opts(&cuda_src, opts)
+                    .expect("nvrtc compilation of compiled kernel failed");
+
+                let src = ptx.to_src();
+
+                // Cache to disk
+                let _ = std::fs::create_dir_all(&cache_dir);
+                if let Ok(mut f) = std::fs::File::create(&cache_path) {
+                    let _ = f.write_all(src.as_bytes());
+                    eprintln!("Compiled kernel: cached PTX to {}", cache_path.display());
+                }
+
+                src
+            }
+        };
+
+        // Load PTX into CUDA
+        let ptx = cudarc::nvrtc::Ptx::from_src(&ptx_src_string);
+        self.dev.load_ptx(ptx, "atari_compiled", compiled_kernel_names)?;
+
+        // Set shared memory carveout for compiled kernels
+        {
+            let lib = unsafe { sys::lib() };
+            let ptx_cstr = std::ffi::CString::new(ptx_src_string).unwrap();
+            let cu_module = unsafe {
+                result::module::load_data(ptx_cstr.as_ptr() as *const _)?
+            };
+            for &name in compiled_kernel_names {
+                let name_c = std::ffi::CString::new(name).unwrap();
+                if let Ok(cu_func) = unsafe { result::module::get_function(cu_module, name_c) } {
+                    unsafe {
+                        let _ = (lib.cuFuncSetAttribute.as_ref().unwrap())(
+                            cu_func,
+                            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                            100,
+                        );
+                    }
+                }
+            }
+        }
+
+        self.compiled_loaded = true;
         Ok(())
     }
 
@@ -310,12 +408,22 @@ impl BatchAtariGpu {
                     ))?;
                 }
             }
+            KernelVariant::Compiled => {
+                let func = self.dev.get_func("atari_compiled", "atari_frame_kernel_compiled").unwrap();
+                let dt = self.d_decode_table.as_ref().expect("decode table not initialized; call set_variant(Compiled) first");
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &self.d_actions, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, dt, self.n as i32,
+                    ))?;
+                }
+            }
             _ => {
                 let name = match self.variant {
                     KernelVariant::Default => "atari_frame_kernel",
                     KernelVariant::Sorted => "atari_frame_kernel_sorted",
                     KernelVariant::Ldg => "atari_frame_kernel_ldg",
-                    KernelVariant::Aot => unreachable!(),
+                    _ => unreachable!(),
                 };
                 let func = self.dev.get_func("atari", name).unwrap();
                 unsafe {
@@ -345,6 +453,16 @@ impl BatchAtariGpu {
             KernelVariant::Aot => {
                 let func = self.dev.get_func("atari", "atari_multi_frame_kernel_aot").unwrap();
                 let dt = self.d_decode_table.as_ref().expect("decode table not initialized; call set_variant(Aot) first");
+                unsafe {
+                    func.launch(cfg, (
+                        &mut self.d_states, &d_actions_multi, &mut self.d_obs,
+                        &self.d_rom, self.rom_len, dt, k as i32, self.n as i32,
+                    ))?;
+                }
+            }
+            KernelVariant::Compiled => {
+                let func = self.dev.get_func("atari_compiled", "atari_multi_frame_kernel_compiled").unwrap();
+                let dt = self.d_decode_table.as_ref().expect("decode table not initialized; call set_variant(Compiled) first");
                 unsafe {
                     func.launch(cfg, (
                         &mut self.d_states, &d_actions_multi, &mut self.d_obs,

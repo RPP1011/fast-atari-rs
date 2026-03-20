@@ -1,2 +1,3 @@
 /target
 roms/*.bin
+.compiled_kernel_cache/

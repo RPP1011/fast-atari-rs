@@ -44,4 +44,5 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed=cuda/src/opcode_sort.cuh");
     println!("cargo:rerun-if-changed=cuda/src/decoded_op.cuh");
     println!("cargo:rerun-if-changed=cuda/src/cpu_6502_aot.cuh");
+    println!("cargo:rerun-if-changed=src/rom_compiler.rs");
 }
